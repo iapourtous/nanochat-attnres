@@ -54,6 +54,10 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--n-kv-head", type=int, default=-1, help="number of KV heads for GQA (-1 = same as n_head, no GQA)")
+parser.add_argument("--intermediate-size", type=int, default=-1, help="MLP intermediate dim (-1 = auto)")
+parser.add_argument("--mlp-type", type=str, default="relu2", choices=["relu2", "swiglu"], help="MLP activation: relu2 or swiglu")
+parser.add_argument("--rope-base", type=float, default=100000.0, help="RoPE base frequency (100K standard, 1M for long-context)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Attention Residuals (arxiv.org/abs/2603.15031)
@@ -84,6 +88,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging or slow compile)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -140,9 +145,16 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    n_kv_head = args.n_kv_head if args.n_kv_head > 0 else num_heads
+    # Clamp n_kv_head to num_heads and ensure divisibility (for reference models with fewer heads)
+    n_kv_head = min(n_kv_head, num_heads)
+    while num_heads % n_kv_head != 0:
+        n_kv_head -= 1
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=n_kv_head, n_embd=model_dim,
+        intermediate_size=args.intermediate_size, mlp_type=args.mlp_type,
+        rope_base=args.rope_base,
         window_pattern=args.window_pattern,
         use_attn_res=args.use_attn_res, attn_res_block_size=args.attn_res_block_size,
     )
@@ -251,7 +263,11 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if not args.no_compile:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+else:
+    print0("torch.compile disabled (--no-compile)")
+
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
