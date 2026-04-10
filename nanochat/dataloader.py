@@ -61,7 +61,7 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
             else:
                 rg_idx = ddp_rank
             while rg_idx < pf.num_row_groups:
-                rg = pf.read_row_group(rg_idx)
+                rg = pf.read_row_group(rg_idx, columns=['text'])
                 batch = rg.column('text').to_pylist()
                 for i in range(0, len(batch), tokenizer_batch_size):
                     yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)

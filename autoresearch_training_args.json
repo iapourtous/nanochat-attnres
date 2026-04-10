@@ -1,0 +1,11 @@
+{
+    "total_batch_size": 4096,
+    "weight_decay": 0.28,
+    "embedding_lr": 0.3,
+    "unembedding_lr": 0.008,
+    "matrix_lr": 0.02,
+    "scalar_lr": 0.5,
+    "warmup_steps": 40,
+    "warmdown_ratio": 0.65,
+    "final_lr_frac": 0.05
+}

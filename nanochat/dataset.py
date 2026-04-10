@@ -4,7 +4,10 @@ This file contains utilities for:
 - iterating over the parquet files and yielding documents from it
 - download the files on demand if they are not on disk
 
-For details of how the dataset was prepared, see `repackage_data_reference.py`.
+Bilingual French+English pretraining:
+- French: FineWeb2-HQ (fra_Latn) — top 10% quality-filtered French web text
+- English: ClimbMix-400B — curated English web text (original nanochat dataset)
+Both are downloaded into the same directory and mixed by the dataloader.
 """
 
 import os
@@ -17,14 +20,69 @@ from multiprocessing import Pool
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
-# The specifics of the current pretraining dataset
+# Dataset sources
 
-# The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+DATASETS = {
+    "fr": {
+        "name": "FineWeb2-HQ French",
+        "base_url": "https://huggingface.co/datasets/epfml/FineWeb2-HQ/resolve/refs%2Fconvert%2Fparquet/fra_Latn/train",
+        "max_shard": 434,           # 435 shards total, ~34B tokens
+        "filename": lambda i: f"fr_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i:04d}.parquet",
+        "repack": True,             # strip embeddings column (~2GB → ~200MB)
+        "keep_columns": ["text", "id", "url", "date", "quality_score", "language_score"],
+    },
+    "en": {
+        "name": "ClimbMix-400B English",
+        "base_url": "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main",
+        "max_shard": 6542,          # 6543 shards total, ~400B tokens
+        "filename": lambda i: f"en_{i:05d}.parquet",
+        "remote_filename": lambda i: f"shard_{i:05d}.parquet",
+        "repack": False,
+        "keep_columns": None,
+    },
+    "wiki-fr": {
+        "name": "Wikipedia French",
+        "base_url": "https://huggingface.co/api/datasets/wikimedia/wikipedia/parquet/20231101.fr/train",
+        "max_shard": 16,            # 17 shards, ~3B tokens, encyclopedic quality
+        "filename": lambda i: f"wikifr_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i}.parquet",
+        "repack": True,
+        "keep_columns": ["text", "title", "id"],
+    },
+    "wiki-en": {
+        "name": "Wikipedia English",
+        "base_url": "https://huggingface.co/api/datasets/wikimedia/wikipedia/parquet/20231101.en/train",
+        "max_shard": 40,            # 41 shards, ~4B tokens, encyclopedic quality
+        "filename": lambda i: f"wikien_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i}.parquet",
+        "repack": True,
+        "keep_columns": ["text", "title", "id"],
+    },
+    "books-fr": {
+        "name": "PleIAs French-PD-Books",
+        "base_url": "https://huggingface.co/api/datasets/PleIAs/French-PD-Books/parquet/default/train",
+        "max_shard": 7,             # 8 shards, ~16B words, classic French literature
+        "filename": lambda i: f"booksfr_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i}.parquet",
+        "repack": True,
+        "keep_columns": ["complete_text", "title"],
+        "rename_text": "complete_text",  # rename to "text" for dataloader compatibility
+    },
+    "diverse-fr": {
+        "name": "PleIAs French-PD-diverse",
+        "base_url": "https://huggingface.co/api/datasets/PleIAs/French-PD-diverse/parquet/default/train",
+        "max_shard": 3,             # 4 shards, ~43B words, archives & Google Books
+        "filename": lambda i: f"divfr_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i}.parquet",
+        "repack": True,
+        "keep_columns": ["complete_text", "title"],
+        "rename_text": "complete_text",  # rename to "text" for dataloader compatibility
+    },
+}
+
 base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+DATA_DIR = os.path.join(base_dir, "base_data_bilingual")
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
@@ -33,29 +91,21 @@ def list_parquet_files(data_dir=None, warn_on_legacy=False):
     """ Looks into a data dir and returns full paths to all parquet files. """
     data_dir = DATA_DIR if data_dir is None else data_dir
 
-    # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
-    # This code will eventually be deleted.
     if not os.path.exists(data_dir):
         if warn_on_legacy:
             print()
             print("=" * 80)
-            print("  WARNING: DATASET UPGRADE REQUIRED")
+            print("  DATASET NOT FOUND")
             print("=" * 80)
             print()
             print(f"  Could not find: {data_dir}")
             print()
-            print("  nanochat recently switched from FinewebEdu-100B to ClimbMix-400B.")
-            print("  Everyone who does `git pull` as of March 4, 2026 is expected to see this message.")
-            print("  To upgrade to the new ClimbMix-400B dataset, run these two commands:")
+            print("  To download the bilingual dataset, run:")
             print()
-            print("    python -m nanochat.dataset -n 170     # download ~170 shards, enough for GPT-2, adjust as desired")
-            print("    python -m scripts.tok_train           # re-train tokenizer on new ClimbMix data")
+            print("    python -m nanochat.dataset --fr 65 --en 65   # ~10B tokens, 50/50 mix")
             print()
-            print("  For now, falling back to your old FinewebEdu-100B dataset...")
             print("=" * 80)
             print()
-        # attempt a fallback to the legacy data directory
-        data_dir = os.path.join(base_dir, "base_data")
 
     parquet_files = sorted([
         f for f in os.listdir(data_dir)
@@ -76,85 +126,135 @@ def parquets_iter_batched(split, start=0, step=1):
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)
         for rg_idx in range(start, pf.num_row_groups, step):
-            rg = pf.read_row_group(rg_idx)
+            rg = pf.read_row_group(rg_idx, columns=['text'])
             texts = rg.column('text').to_pylist()
             yield texts
 
 # -----------------------------------------------------------------------------
-def download_single_file(index):
-    """ Downloads a single file index, with some backoff """
+def _download_task(task):
+    """Downloads a single shard. Task is (lang, index) tuple."""
+    lang, index = task
+    ds = DATASETS[lang]
 
-    # Construct the local filepath for this file and skip if it already exists
-    filename = index_to_filename(index)
-    filepath = os.path.join(DATA_DIR, filename)
+    local_name = ds["filename"](index)
+    filepath = os.path.join(DATA_DIR, local_name)
     if os.path.exists(filepath):
-        print(f"Skipping {filepath} (already exists)")
+        print(f"Skipping {local_name} (already exists)")
         return True
 
-    # Construct the remote URL for this file
-    url = f"{BASE_URL}/{filename}"
-    print(f"Downloading {filename}...")
+    remote_name = ds["remote_filename"](index)
+    url = f"{ds['base_url']}/{remote_name}"
+    raw_path = filepath + ".raw.tmp"
+    print(f"Downloading {local_name} from {ds['name']}...")
 
-    # Download with retries
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
+            response = requests.get(url, stream=True, timeout=60, allow_redirects=True)
             response.raise_for_status()
-            # Write to temporary file first
-            temp_path = filepath + f".tmp"
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+
+            dl_path = raw_path if ds["repack"] else filepath + ".tmp"
+            with open(dl_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
-            # Move temp file to final location
-            os.rename(temp_path, filepath)
-            print(f"Successfully downloaded {filename}")
+
+            # Repack if needed (strip heavy columns, rename text column)
+            if ds["repack"]:
+                table = pq.read_table(raw_path)
+                available_cols = [c for c in ds["keep_columns"] if c in table.column_names]
+                table = table.select(available_cols)
+                # Rename text column if needed (e.g. "complete_text" → "text")
+                rename_col = ds.get("rename_text")
+                if rename_col and rename_col in table.column_names:
+                    table = table.rename_columns(
+                        ["text" if c == rename_col else c for c in table.column_names]
+                    )
+                pq.write_table(table, filepath + ".tmp")
+                del table
+                os.remove(raw_path)
+
+            os.rename(filepath + ".tmp", filepath)
+            size_mb = os.path.getsize(filepath) / 1e6
+            extra = ", embeddings stripped" if ds["repack"] else ""
+            print(f"Saved {local_name} ({size_mb:.0f} MB{extra})")
             return True
 
         except (requests.RequestException, IOError) as e:
-            print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            # Clean up any partial files
-            for path in [filepath + f".tmp", filepath]:
+            print(f"Attempt {attempt}/{max_attempts} failed for {local_name}: {e}")
+            for path in [raw_path, filepath + ".tmp", filepath]:
                 if os.path.exists(path):
                     try:
                         os.remove(path)
                     except:
                         pass
-            # Try a few times with exponential backoff: 2^attempt seconds
             if attempt < max_attempts:
                 wait_time = 2 ** attempt
                 print(f"Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
             else:
-                print(f"Failed to download {filename} after {max_attempts} attempts")
+                print(f"Failed to download {local_name} after {max_attempts} attempts")
                 return False
 
     return False
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download pretraining dataset shards")
-    parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of train shards to download (default: -1), -1 = disable")
-    parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
+    parser = argparse.ArgumentParser(description="Download bilingual pretraining data")
+    # Core datasets
+    parser.add_argument("--fr", type=int, default=0,
+                        help="FineWeb2-HQ French shards. Each ≈ 78M tokens. -1 = all 435.")
+    parser.add_argument("--en", type=int, default=0,
+                        help="ClimbMix English shards. Each ≈ 61M tokens. -1 = all 6543.")
+    # High-quality supplements
+    parser.add_argument("--wiki-fr", type=int, default=0,
+                        help="Wikipedia French shards. -1 = all 17. ~3B tokens.")
+    parser.add_argument("--wiki-en", type=int, default=0,
+                        help="Wikipedia English shards. -1 = all 41. ~4B tokens.")
+    parser.add_argument("--books-fr", type=int, default=0,
+                        help="PleIAs French-PD-Books shards. -1 = all 8. Classic literature.")
+    parser.add_argument("--diverse-fr", type=int, default=0,
+                        help="PleIAs French-PD-diverse shards. -1 = all 4. Archives & books.")
+    parser.add_argument("-w", "--num-workers", type=int, default=4,
+                        help="Parallel download workers (default: 4)")
     args = parser.parse_args()
 
-    # Prepare the output directory
+    # Map CLI args to dataset keys
+    source_counts = {
+        "fr": args.fr, "en": args.en,
+        "wiki-fr": args.wiki_fr, "wiki-en": args.wiki_en,
+        "books-fr": args.books_fr, "diverse-fr": args.diverse_fr,
+    }
+
+    if all(v == 0 for v in source_counts.values()):
+        parser.error("Specify at least one source. Examples:\n"
+                     "  --fr 130 --en 170                    # core bilingual (~20B tokens)\n"
+                     "  --wiki-fr -1 --wiki-en -1            # all Wikipedia\n"
+                     "  --books-fr -1 --diverse-fr -1        # PleIAs French heritage\n"
+                     "  --fr 130 --en 170 --wiki-fr -1 --wiki-en -1 --books-fr -1  # everything")
+
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # The way this works is that the user specifies the number of train shards to download via the -n flag.
-    # In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
-    num_train_shards = MAX_SHARD if args.num_files == -1 else min(args.num_files, MAX_SHARD)
-    ids_to_download = list(range(num_train_shards))
-    ids_to_download.append(MAX_SHARD) # always download the validation shard
+    # Build download task list
+    tasks = []
+    for source, count in source_counts.items():
+        if count == 0:
+            continue
+        ds = DATASETS[source]
+        max_shard = ds["max_shard"]
+        n = max_shard + 1 if count == -1 else min(count, max_shard + 1)
+        for i in range(n):
+            tasks.append((source, i))
 
-    # Download the shards
-    print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
+    # Summary
+    summary = {s: sum(1 for k, _ in tasks if k == s) for s in source_counts if source_counts[s] != 0}
+    parts = [f"{v} {DATASETS[k]['name']}" for k, v in summary.items()]
+    print(f"Downloading {len(tasks)} shards: {', '.join(parts)}")
     print(f"Target directory: {DATA_DIR}")
     print()
-    with Pool(processes=args.num_workers) as pool:
-        results = pool.map(download_single_file, ids_to_download)
 
-    # Report results
-    successful = sum(1 for success in results if success)
-    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
+    with Pool(processes=args.num_workers) as pool:
+        results = pool.map(_download_task, tasks)
+
+    successful = sum(1 for s in results if s)
+    print(f"Done! {successful}/{len(tasks)} shards downloaded to {DATA_DIR}")
