@@ -9,7 +9,7 @@ echo "============================================="
 echo " Server Setup: nanochat + AttnRes (1 GPU)"
 echo "============================================="
 
-cd /workspace/nanochat-attnres
+cd "$(dirname "$0")/.."
 
 # 1. Install dependencies
 echo "[1/4] Installing dependencies..."
@@ -20,9 +20,11 @@ uv run python -c "import torch; print(f'     GPU: {torch.cuda.get_device_name(0)
 echo ""
 echo "[2/4] Downloading datasets..."
 uv run python -m nanochat.dataset \
-  --fr 130 --en 170 \
+  --fr -1 --en 170 \
   --wiki-fr -1 --wiki-en -1 \
   --books-fr -1 --diverse-fr -1 \
+  --europarl -1 --arxiv -1 \
+  --mlsum-fr -1 --mlsum-en -1 \
   -w 8
 
 # 3. Train tokenizer
