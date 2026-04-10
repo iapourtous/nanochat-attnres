@@ -197,7 +197,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
+        from datetime import timedelta
+        dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(minutes=30))
         dist.barrier()
     else:
         device = torch.device(device_type) # mps|cpu

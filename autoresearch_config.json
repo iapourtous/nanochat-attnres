@@ -1,0 +1,22 @@
+{
+    "bedrock": {
+        "model_id": "us.anthropic.claude-sonnet-4-6",
+        "region": "us-east-1",
+        "max_tokens": 16384
+    },
+    "training": {
+        "depth": 8,
+        "aspect_ratio": 64,
+        "device_batch_size": 32,
+        "total_batch_size": 524288,
+        "num_iterations": 500,
+        "attn_res_block_size": 8,
+        "max_seq_len": 2048,
+        "window_pattern": "L"
+    },
+    "experiment": {
+        "max_experiments": -1,
+        "timeout_multiplier": 3,
+        "tag": null
+    }
+}

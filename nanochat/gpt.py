@@ -12,12 +12,12 @@ Notable features:
 - Flash Attention 3 integration
 """
 
-from functools import partial
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
@@ -37,10 +37,35 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Attention Residuals (AttnRes): replace fixed residual accumulation with learned
+    # depth-wise softmax attention over block representations. See arxiv.org/abs/2603.15031
+    use_attn_res: bool = False
+    attn_res_block_size: int = 8 # sublayer count per block (each transformer layer = 2 sublayers)
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+
+def block_attn_res(block_reprs, partial, query):
+    """
+    Depth-wise softmax attention over block representations (Attention Residuals).
+    Block representations are detached (no gradient) — gradients flow through partial only.
+
+    Args:
+        block_reprs: list of (B, T, D) tensors — completed block sums (detached)
+        partial: (B, T, D) — current intra-block partial sum (has gradient)
+        query: (D,) — learned pseudo-query for this depth position
+    Returns:
+        (B, T, D) — attention-weighted aggregation
+    """
+    if not block_reprs:
+        return partial
+    V = torch.stack(block_reprs + [partial], dim=0)  # (N+1, B, T, D)
+    K = F.rms_norm(V, (V.size(-1),))
+    logits = torch.einsum('d, nbtd -> nbt', query.to(K.dtype), K)
+    attn = F.softmax(logits, dim=0)
+    return torch.einsum('nbt, nbtd -> btd', attn, V)
+
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
@@ -144,6 +169,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # AttnRes: per-sublayer pseudo-queries (initialized to zero = uniform attention = standard residuals)
+        if config.use_attn_res:
+            self.attn_res_q_attn = nn.Parameter(torch.zeros(config.n_embd))
+            self.attn_res_q_mlp = nn.Parameter(torch.zeros(config.n_embd))
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -179,6 +208,9 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        # AttnRes: final aggregation query (only when enabled)
+        if config.use_attn_res:
+            self.attn_res_q_final = nn.Parameter(torch.zeros(config.n_embd))
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
         self.smear_gate = Linear(24, 1, bias=False)
         self.smear_lambda = nn.Parameter(torch.zeros(1))
@@ -246,6 +278,13 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # AttnRes: zero-init all pseudo-queries (uniform attention = standard residuals at start)
+        if self.config.use_attn_res:
+            for block in self.transformer.h:
+                torch.nn.init.zeros_(block.attn_res_q_attn)
+                torch.nn.init.zeros_(block.attn_res_q_mlp)
+            torch.nn.init.zeros_(self.attn_res_q_final)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -355,7 +394,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        attn_res = self.attn_res_q_final.numel() if self.config.use_attn_res else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + attn_res
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -363,6 +403,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'attn_res': attn_res,
             'total': total,
         }
 
@@ -378,7 +419,13 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # AttnRes: extract 1D pseudo-queries from matrix_params (they need AdamW, not Muon)
+        attn_res_params = []
+        if self.config.use_attn_res:
+            attn_res_params = [p for p in matrix_params if p.ndim == 1]
+            matrix_params = [p for p in matrix_params if p.ndim > 1]
+            attn_res_params.append(self.attn_res_q_final)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_res_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -394,6 +441,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # AttnRes pseudo-queries: AdamW with moderate LR
+        if attn_res_params:
+            param_groups.append(dict(kind='adamw', params=attn_res_params, lr=scalar_lr * 0.02, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -444,16 +494,54 @@ class GPT(nn.Module):
                 x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
-                x_backout = x
+
+        if self.config.use_attn_res:
+            # --- Attention Residuals path ---
+            # Block representations are detached (saves memory, gradients flow via partial).
+            # Activation checkpointing on attention + MLP sublayers.
+            layers_per_block = self.config.attn_res_block_size // 2
+            block_reprs = []  # detached block representations (no gradient stored)
+            partial = x
+
+            for i, layer in enumerate(self.transformer.h):
+                # Pre-attention: depth-wise attention over blocks + partial
+                h = block_attn_res(block_reprs, partial, layer.attn_res_q_attn)
+
+                # Block boundary: store detached partial as completed block
+                if i % layers_per_block == 0:
+                    block_reprs.append(partial.detach())
+                    partial = torch.zeros_like(x)
+
+                # Self-attention sublayer (with activation checkpointing)
+                ve = self.value_embeds[str(i)](idx).to(h.dtype) if str(i) in self.value_embeds else None
+                attn_out = grad_checkpoint(layer.attn, norm(h), ve, cos_sin, self.window_sizes[i], None, use_reentrant=False)
+                partial = partial + attn_out
+
+                # Pre-MLP: depth-wise attention over blocks + partial
+                h = block_attn_res(block_reprs, partial, layer.attn_res_q_mlp)
+
+                # MLP sublayer (with activation checkpointing)
+                mlp_out = grad_checkpoint(layer.mlp, norm(h), use_reentrant=False)
+                partial = partial + mlp_out
+
+                if i == backout_layer:
+                    x_backout = block_attn_res(block_reprs, partial, self.attn_res_q_final)
+
+            # Final aggregation
+            x = block_attn_res(block_reprs, partial, self.attn_res_q_final)
+        else:
+            # --- Standard residual path (original nanochat) ---
+            x0 = x  # save initial normalized embedding for x0 residual
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                if i == backout_layer:
+                    x_backout = x
+
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
