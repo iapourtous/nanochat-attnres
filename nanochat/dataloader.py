@@ -16,13 +16,38 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import os
 import torch
 import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+# Curriculum learning: map file prefixes to categories for weighted sampling
+CATEGORY_MAP = {
+    "general": ["fr_", "en_", "wikifr_", "wikien_", "booksfr_", "divfr_", "europarl_", "mlsumfr_", "mlsumen_"],
+    "math": ["nemmath_", "owm_", "arxiv_"],
+    "reasoning": ["rcore_", "synloge_", "synlogh_"],
+    "docs": ["docs_"],
+}
+
+# Phase weights: {category: (phase1_weight, phase2_weight)}
+CURRICULUM_WEIGHTS = {
+    "general":   (0.50, 0.25),
+    "math":      (0.30, 0.35),
+    "reasoning": (0.15, 0.30),
+    "docs":      (0.05, 0.10),
+}
+
+def _categorize_file(filename):
+    """Return the curriculum category for a parquet filename."""
+    for category, prefixes in CATEGORY_MAP.items():
+        for prefix in prefixes:
+            if filename.startswith(prefix):
+                return category
+    return "general"  # fallback
+
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, curriculum_step_fn=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
@@ -36,6 +61,19 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+
+    if curriculum_step_fn is not None and split == "train":
+        categorized = {}
+        for path in parquet_paths:
+            cat = _categorize_file(os.path.basename(path))
+            categorized.setdefault(cat, []).append(path)
+        if ddp_rank == 0:
+            for cat, paths in sorted(categorized.items()):
+                print(f"  Curriculum [{cat}]: {len(paths)} files")
+        yield from _curriculum_document_batches(
+            categorized, tokenizer_batch_size, curriculum_step_fn, ddp_rank, ddp_world_size
+        )
+        return
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
@@ -71,11 +109,54 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         epoch += 1
 
 
+def _curriculum_document_batches(categorized, tokenizer_batch_size, curriculum_step_fn, ddp_rank, ddp_world_size):
+    """Yield document batches with curriculum-weighted category sampling."""
+    import random
+    rng = random.Random(42)
+
+    # Build per-category infinite iterators
+    cat_iters = {}
+    categories = sorted(categorized.keys())
+    for cat in categories:
+        cat_iters[cat] = _cycle_parquet_files(
+            categorized[cat], ddp_rank, ddp_world_size, tokenizer_batch_size
+        )
+
+    pq_idx, rg_idx, epoch = 0, 0, 1
+
+    while True:
+        weights = curriculum_step_fn()  # returns {category: weight}
+        cats = [c for c in categories if c in weights and weights[c] > 0]
+        w = [weights[c] for c in cats]
+        if not cats:
+            cats = categories
+            w = [1.0 / len(cats)] * len(cats)
+        chosen_cat = rng.choices(cats, weights=w, k=1)[0]
+        batch, (pq_idx, rg_idx, epoch) = next(cat_iters[chosen_cat])
+        yield batch, (pq_idx, rg_idx, epoch)
+
+
+def _cycle_parquet_files(paths, ddp_rank, ddp_world_size, tokenizer_batch_size):
+    """Infinite iterator over documents from a list of parquet files."""
+    epoch = 1
+    while True:
+        for pq_idx, filepath in enumerate(paths):
+            pf = pq.ParquetFile(filepath)
+            rg_idx = ddp_rank
+            while rg_idx < pf.num_row_groups:
+                rg = pf.read_row_group(rg_idx, columns=['text'])
+                batch = rg.column('text').to_pylist()
+                for i in range(0, len(batch), tokenizer_batch_size):
+                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
+                rg_idx += ddp_world_size
+        epoch += 1
+
+
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, curriculum_step_fn=None
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -96,7 +177,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, curriculum_step_fn)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
