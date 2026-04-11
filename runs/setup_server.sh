@@ -24,7 +24,6 @@ uv run python -m nanochat.dataset \
   --wiki-fr -1 --wiki-en -1 \
   --books-fr -1 --diverse-fr -1 \
   --europarl -1 --arxiv -1 \
-  --mlsum-fr -1 --mlsum-en -1 \
   -w 8
 
 # 2b. Download STEM datasets (curriculum learning)

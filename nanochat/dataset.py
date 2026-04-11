@@ -127,26 +127,6 @@ DATASETS = {
         "repack": True,
         "keep_columns": ["text"],
     },
-    "mlsum-fr": {
-        "name": "MLSUM French summaries",
-        "base_url": "https://huggingface.co/datasets/mlsum/resolve/refs%2Fconvert%2Fparquet/fr/train",
-        "max_shard": 0,             # 1 shard, ~400K articles+résumés
-        "filename": lambda i: f"mlsumfr_{i:04d}.parquet",
-        "remote_filename": lambda i: f"{i:04d}.parquet",
-        "repack": True,
-        "keep_columns": ["text", "summary"],
-        "concat_columns": ["text", "summary"],  # concatenate into single text field
-    },
-    "mlsum-en": {
-        "name": "MLSUM English summaries",
-        "base_url": "https://huggingface.co/datasets/mlsum/resolve/refs%2Fconvert%2Fparquet/en/train",
-        "max_shard": 0,             # 1 shard, ~300K articles+résumés
-        "filename": lambda i: f"mlsumen_{i:04d}.parquet",
-        "remote_filename": lambda i: f"{i:04d}.parquet",
-        "repack": True,
-        "keep_columns": ["text", "summary"],
-        "concat_columns": ["text", "summary"],  # concatenate into single text field
-    },
     "nemmath": {
         "name": "Nemotron-CC-Math-v1 4plus",
         "base_url": "https://huggingface.co/api/datasets/nvidia/Nemotron-CC-Math-v1/parquet/4plus/train",
@@ -446,10 +426,6 @@ if __name__ == "__main__":
                         help="Europarl FR↔EN shards. -1 = all 2. Parliamentary debates.")
     parser.add_argument("--arxiv", type=int, default=0,
                         help="RedPajama arXiv shards. -1 = all 12. Scientific papers (~43GB).")
-    parser.add_argument("--mlsum-fr", type=int, default=0,
-                        help="MLSUM French summaries. -1 = all 1. ~400K articles.")
-    parser.add_argument("--mlsum-en", type=int, default=0,
-                        help="MLSUM English summaries. -1 = all 1. ~300K articles.")
     # Math datasets
     parser.add_argument("--nemmath", type=int, default=0,
                         help="Nemotron-CC-Math shards. -1 = all 350. (~25GB, gated)")
@@ -472,7 +448,6 @@ if __name__ == "__main__":
         "wiki-fr": args.wiki_fr, "wiki-en": args.wiki_en,
         "books-fr": args.books_fr, "diverse-fr": args.diverse_fr,
         "europarl": args.europarl, "arxiv": args.arxiv,
-        "mlsum-fr": args.mlsum_fr, "mlsum-en": args.mlsum_en,
         "nemmath": args.nemmath, "owm": args.owm,
         "rcore": args.rcore,
         "synlog-easy": args.synlog, "synlog-hard": args.synlog,

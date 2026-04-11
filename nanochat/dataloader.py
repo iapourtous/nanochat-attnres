@@ -25,7 +25,7 @@ from nanochat.dataset import list_parquet_files
 
 # Curriculum learning: map file prefixes to categories for weighted sampling
 CATEGORY_MAP = {
-    "general": ["fr_", "en_", "wikifr_", "wikien_", "booksfr_", "divfr_", "europarl_", "mlsumfr_", "mlsumen_"],
+    "general": ["fr_", "en_", "wikifr_", "wikien_", "booksfr_", "divfr_", "europarl_"],
     "math": ["nemmath_", "owm_", "arxiv_"],
     "reasoning": ["rcore_", "synloge_", "synlogh_"],
     "docs": ["docs_"],
