@@ -118,6 +118,25 @@ DATASETS = {
         "keep_columns": ["text", "summary"],
         "concat_columns": ["text", "summary"],
     },
+    "nemmath": {
+        "name": "Nemotron-CC-Math-v1 4plus",
+        "base_url": "https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1/resolve/refs%2Fconvert%2Fparquet/4plus/train",
+        "max_shard": 349,
+        "filename": lambda i: f"nemmath_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i:04d}.parquet",
+        "repack": True,
+        "keep_columns": ["text"],
+        "hf_gated": True,
+    },
+    "owm": {
+        "name": "OpenWebMath",
+        "base_url": "https://huggingface.co/datasets/open-web-math/open-web-math/resolve/refs%2Fconvert%2Fparquet/default/train",
+        "max_shard": 149,
+        "filename": lambda i: f"owm_{i:04d}.parquet",
+        "remote_filename": lambda i: f"{i:04d}.parquet",
+        "repack": True,
+        "keep_columns": ["text"],
+    },
 }
 
 DATA_DIR = os.path.join(get_base_dir(), "base_data_bilingual")
@@ -140,6 +159,20 @@ def _download_task(task):
 
     headers = {}
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if not hf_token:
+        # Try loading from .env file at project root
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, value = line.partition("=")
+                        if key.strip() == "HF_TOKEN":
+                            hf_token = value.strip()
+                            break
+    if ds.get("hf_gated") and not hf_token:
+        print(f"WARNING: {ds['name']} requires HF_TOKEN. Set HF_TOKEN env var or add to .env")
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
 
@@ -221,6 +254,8 @@ if __name__ == "__main__":
     parser.add_argument("--arxiv", type=int, default=0, help="RedPajama arXiv. -1 = all 12. (~43GB)")
     parser.add_argument("--mlsum-fr", type=int, default=0, help="MLSUM French summaries. -1 = all 1.")
     parser.add_argument("--mlsum-en", type=int, default=0, help="MLSUM English summaries. -1 = all 1.")
+    parser.add_argument("--nemmath", type=int, default=0, help="Nemotron-CC-Math shards. -1 = all 350. (~25GB, gated)")
+    parser.add_argument("--owm", type=int, default=0, help="OpenWebMath shards. -1 = all 150. (~10GB)")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Parallel download workers")
     args = parser.parse_args()
 
@@ -230,6 +265,7 @@ if __name__ == "__main__":
         "books-fr": args.books_fr, "diverse-fr": args.diverse_fr,
         "europarl": args.europarl, "arxiv": args.arxiv,
         "mlsum-fr": args.mlsum_fr, "mlsum-en": args.mlsum_en,
+        "nemmath": args.nemmath, "owm": args.owm,
     }
 
     if all(v == 0 for v in source_counts.values()):
