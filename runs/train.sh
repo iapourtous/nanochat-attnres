@@ -29,7 +29,11 @@ DEVICE_BATCH_SIZE=5
 # 5 * 2048 = 10240, 522240 / 10240 = 51 exact
 TOTAL_BATCH_SIZE=522240
 WINDOW_PATTERN=SSSL
-RUN_NAME="attnres-v3-hybrid-d${DEPTH}"
+# Training ratio:
+#   150 = ~92B tokens, good compromise (~52 days on 1x RTX 5090, ~5 days on 12x)
+#   483 = ALL data (~295B tokens, ~126 days on 1x, ~10 days on 12x)
+TARGET_RATIO=150
+RUN_NAME="attnres-v3-curriculum-d${DEPTH}"
 
 echo "============================================="
 echo " nanochat + AttnRes v3 Hybrid (~978M params)"
@@ -63,8 +67,11 @@ python -m scripts.base_train \
     --max-seq-len=${MAX_SEQ_LEN} \
     --device-batch-size=${DEVICE_BATCH_SIZE} \
     --total-batch-size=${TOTAL_BATCH_SIZE} \
-    --target-param-data-ratio=80 \
+    --target-param-data-ratio=${TARGET_RATIO} \
     --use-attn-res \
     --attn-res-block-size=${ATTN_RES_BLOCK_SIZE} \
+    --curriculum \
+    --curriculum-phase1-ratio=0.6 \
+    --curriculum-transition=2000 \
     --run="${RUN_NAME}" \
     --save-every=10000

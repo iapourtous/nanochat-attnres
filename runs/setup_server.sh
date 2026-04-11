@@ -27,6 +27,18 @@ uv run python -m nanochat.dataset \
   --mlsum-fr -1 --mlsum-en -1 \
   -w 8
 
+# 2b. Download STEM datasets (curriculum learning)
+echo ""
+echo "[2b/4] Downloading STEM datasets..."
+if [ -f .env ]; then
+    export $(grep HF_TOKEN .env | xargs)
+fi
+uv run python3 scripts/download_data.py \
+  --nemmath 350 --owm 150 \
+  --rcore -1 --synlog -1 \
+  --docs -1 \
+  -w 8
+
 # 3. Train tokenizer
 echo ""
 echo "[3/4] Training bilingual tokenizer..."
