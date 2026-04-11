@@ -22,6 +22,14 @@ def get_base_dir():
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
+# Conversion functions for HF streaming datasets
+def _convert_reasoning_core(example):
+    prompt = example.get("prompt", "")
+    answer = example.get("answer", "")
+    if not prompt:
+        return None
+    return prompt + "\n" + answer
+
 DATASETS = {
     "fr": {
         "name": "FineWeb2-HQ French",
@@ -137,6 +145,15 @@ DATASETS = {
         "repack": True,
         "keep_columns": ["text"],
     },
+    "rcore": {
+        "name": "Reasoning-Core SPT",
+        "hf_dataset": "reasoning-core/symbolic-pretraining-pile",
+        "hf_config": None,
+        "convert_fn": _convert_reasoning_core,
+        "filename": lambda i: f"rcore_{i:04d}.parquet",
+        "rows_per_shard": 50000,
+        "hf_download": True,
+    },
 }
 
 DATA_DIR = os.path.join(get_base_dir(), "base_data_bilingual")
@@ -242,6 +259,66 @@ def _download_task(task):
     return False
 
 
+def _download_hf_dataset(lang, max_shards):
+    """Download a dataset via HuggingFace streaming and convert to parquet shards."""
+    ds = DATASETS[lang]
+    convert_fn = ds["convert_fn"]
+    rows_per_shard = ds["rows_per_shard"]
+    hf_dataset = ds["hf_dataset"]
+    hf_config = ds.get("hf_config")
+
+    print(f"Streaming {ds['name']} from HuggingFace ({hf_dataset})...")
+
+    from datasets import load_dataset
+    hf_ds = load_dataset(hf_dataset, hf_config, split="train", streaming=True)
+
+    shard_idx = 0
+    buffer = []
+
+    for example in hf_ds:
+        # Stop if we've written enough shards
+        if max_shards != -1 and shard_idx >= max_shards:
+            break
+
+        text = convert_fn(example)
+        if text is None:
+            continue
+        buffer.append(text)
+
+        if len(buffer) >= rows_per_shard:
+            filepath = os.path.join(DATA_DIR, ds["filename"](shard_idx))
+            if os.path.exists(filepath):
+                print(f"Skipping {ds['filename'](shard_idx)} (already exists)")
+            else:
+                table = pa.table({"text": buffer})
+                tmp_path = filepath + ".tmp"
+                pq.write_table(table, tmp_path)
+                os.rename(tmp_path, filepath)
+                size_mb = os.path.getsize(filepath) / 1e6
+                print(f"Saved {ds['filename'](shard_idx)} ({size_mb:.0f} MB, {len(buffer)} rows)")
+                del table
+            buffer = []
+            shard_idx += 1
+
+    # Write remaining rows as a final partial shard
+    if buffer and (max_shards == -1 or shard_idx < max_shards):
+        filepath = os.path.join(DATA_DIR, ds["filename"](shard_idx))
+        if os.path.exists(filepath):
+            print(f"Skipping {ds['filename'](shard_idx)} (already exists)")
+        else:
+            table = pa.table({"text": buffer})
+            tmp_path = filepath + ".tmp"
+            pq.write_table(table, tmp_path)
+            os.rename(tmp_path, filepath)
+            size_mb = os.path.getsize(filepath) / 1e6
+            print(f"Saved {ds['filename'](shard_idx)} ({size_mb:.0f} MB, {len(buffer)} rows)")
+            del table
+        shard_idx += 1
+
+    print(f"Done streaming {ds['name']}: {shard_idx} shards written.")
+    return shard_idx
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download bilingual pretraining data (standalone, no torch)")
     parser.add_argument("--fr", type=int, default=0, help="FineWeb2-HQ French shards. -1 = all 435.")
@@ -256,6 +333,8 @@ if __name__ == "__main__":
     parser.add_argument("--mlsum-en", type=int, default=0, help="MLSUM English summaries. -1 = all 1.")
     parser.add_argument("--nemmath", type=int, default=0, help="Nemotron-CC-Math shards. -1 = all 350. (~25GB, gated)")
     parser.add_argument("--owm", type=int, default=0, help="OpenWebMath shards. -1 = all 150. (~10GB)")
+    # Reasoning datasets (HF streaming)
+    parser.add_argument("--rcore", type=int, default=0, help="Reasoning-Core SPT shards (50K rows each). -1 = all.")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Parallel download workers")
     args = parser.parse_args()
 
@@ -266,6 +345,7 @@ if __name__ == "__main__":
         "europarl": args.europarl, "arxiv": args.arxiv,
         "mlsum-fr": args.mlsum_fr, "mlsum-en": args.mlsum_en,
         "nemmath": args.nemmath, "owm": args.owm,
+        "rcore": args.rcore,
     }
 
     if all(v == 0 for v in source_counts.values()):
@@ -273,24 +353,47 @@ if __name__ == "__main__":
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    tasks = []
+    # Separate HF streaming datasets from direct-download datasets
+    hf_sources = {}
+    direct_sources = {}
     for source, count in source_counts.items():
         if count == 0:
             continue
+        if DATASETS[source].get("hf_download"):
+            hf_sources[source] = count
+        else:
+            direct_sources[source] = count
+
+    # Build download task list for direct-download datasets
+    tasks = []
+    for source, count in direct_sources.items():
         ds = DATASETS[source]
         max_shard = ds["max_shard"]
         n = max_shard + 1 if count == -1 else min(count, max_shard + 1)
         for i in range(n):
             tasks.append((source, i))
 
-    summary = {s: sum(1 for k, _ in tasks if k == s) for s in source_counts if source_counts[s] != 0}
-    parts = [f"{v} {DATASETS[k]['name']}" for k, v in summary.items()]
-    print(f"Downloading {len(tasks)} shards: {', '.join(parts)}")
+    # Summary
+    all_parts = []
+    if tasks:
+        summary = {s: sum(1 for k, _ in tasks if k == s) for s in direct_sources}
+        all_parts += [f"{v} {DATASETS[k]['name']}" for k, v in summary.items()]
+    for source, count in hf_sources.items():
+        label = "all" if count == -1 else str(count)
+        all_parts.append(f"{label} {DATASETS[source]['name']} (streaming)")
+    print(f"Downloading: {', '.join(all_parts)}")
     print(f"Target directory: {DATA_DIR}")
     print()
 
-    with Pool(processes=args.num_workers) as pool:
-        results = pool.map(_download_task, tasks)
+    # Download direct-download datasets via parallel Pool
+    if tasks:
+        with Pool(processes=args.num_workers) as pool:
+            results = pool.map(_download_task, tasks)
+        successful = sum(1 for s in results if s)
+        print(f"Direct downloads: {successful}/{len(tasks)} shards")
 
-    successful = sum(1 for s in results if s)
-    print(f"Done! {successful}/{len(tasks)} shards downloaded to {DATA_DIR}")
+    # Download HF streaming datasets sequentially
+    for source, count in hf_sources.items():
+        _download_hf_dataset(source, count)
+
+    print(f"Done! All downloads saved to {DATA_DIR}")
