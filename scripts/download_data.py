@@ -46,6 +46,11 @@ def _convert_synlogic(example):
         parts.append(answer)
     return "\n".join(parts)
 
+def _convert_textbook(example):
+    """Convert programming textbook markdown to plain text."""
+    text = example.get("markdown", "") or example.get("text", "")
+    return text if text else None
+
 DATASETS = {
     "fr": {
         "name": "FineWeb2-HQ French",
@@ -186,6 +191,15 @@ DATASETS = {
         "convert_fn": _convert_synlogic,
         "filename": lambda i: f"synlogh_{i:04d}.parquet",
         "rows_per_shard": 35000,
+        "hf_download": True,
+    },
+    "docs": {
+        "name": "Programming Textbooks (C/C++/Rust/Python)",
+        "hf_dataset": "vikp/textbook_quality_programming",
+        "hf_config": None,
+        "convert_fn": _convert_textbook,
+        "filename": lambda i: f"docs_{i:04d}.parquet",
+        "rows_per_shard": 5000,
         "hf_download": True,
     },
 }
@@ -370,6 +384,8 @@ if __name__ == "__main__":
     # Reasoning datasets (HF streaming)
     parser.add_argument("--rcore", type=int, default=0, help="Reasoning-Core SPT shards (50K rows each). -1 = all.")
     parser.add_argument("--synlog", type=int, default=0, help="SynLogic shards (easy+hard). -1 = all.")
+    parser.add_argument("--docs", type=int, default=0,
+                        help="Programming textbooks (C/C++/Rust/Python). -1 = all. ~183MB.")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Parallel download workers")
     args = parser.parse_args()
 
@@ -382,6 +398,7 @@ if __name__ == "__main__":
         "nemmath": args.nemmath, "owm": args.owm,
         "rcore": args.rcore,
         "synlog-easy": args.synlog, "synlog-hard": args.synlog,
+        "docs": args.docs,
     }
 
     if all(v == 0 for v in source_counts.values()):
