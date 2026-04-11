@@ -167,18 +167,48 @@ class MLP(nn.Module):
             return x
 
 
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+class GatedConv(nn.Module):
+    """Gated depthwise short convolution (inspired by LFM 2.5 / Liquid AI).
+    Double-gated: input gate B and output gate C around a causal depthwise conv.
+    Replaces attention for local context mixing at ~700x less FLOPs per layer."""
+    def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        d = config.n_embd
+        self.gate_b = Linear(d, d, bias=False)
+        self.gate_c = Linear(d, d, bias=False)
+        self.conv = nn.Conv1d(d, d, kernel_size=3, padding=0, groups=d, bias=False)
+        self.out_proj = Linear(d, d, bias=False)
+
+    def forward(self, x):
+        b_gate = torch.sigmoid(self.gate_b(x))
+        c_gate = torch.sigmoid(self.gate_c(x))
+        y = b_gate * x
+        y = y.transpose(1, 2)
+        y = F.pad(y, (2, 0))
+        y = F.conv1d(y, self.conv.weight.to(dtype=y.dtype), groups=y.size(1))
+        y = y.transpose(1, 2)
+        return self.out_proj(c_gate * y)
+
+
+class Block(nn.Module):
+    def __init__(self, config, layer_idx, block_type='attention'):
+        super().__init__()
+        self.block_type = block_type
+        if block_type == 'conv':
+            self.conv = GatedConv(config)
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-        # AttnRes: per-sublayer pseudo-queries (initialized to zero = uniform attention = standard residuals)
+        # AttnRes: per-sublayer pseudo-queries
         if config.use_attn_res:
             self.attn_res_q_attn = nn.Parameter(torch.zeros(config.n_embd))
             self.attn_res_q_mlp = nn.Parameter(torch.zeros(config.n_embd))
 
-    def forward(self, x, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
+    def forward(self, x, cos_sin=None, window_size=None, kv_cache=None):
+        if self.block_type == 'conv':
+            x = x + self.conv(norm(x))
+        else:
+            x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -200,9 +230,19 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        # Determine block types from window_pattern: S=conv, L=attention
+        pattern = config.window_pattern.upper()
+        self.block_types = []
+        for i in range(config.n_layer):
+            char = pattern[i % len(pattern)]
+            self.block_types.append('conv' if char == 'S' else 'attention')
+        self.block_types[-1] = 'attention'  # final layer always attention
+        n_attn = sum(1 for t in self.block_types if t == 'attention')
+        n_conv = sum(1 for t in self.block_types if t == 'conv')
+        print0(f"Hybrid architecture: {n_attn} attention + {n_conv} conv layers (pattern: {pattern})")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, self.block_types[layer_idx]) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -253,10 +293,20 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.block_type == 'conv':
+                # Conv block init
+                torch.nn.init.uniform_(block.conv.gate_b.weight, -s, s)
+                torch.nn.init.uniform_(block.conv.gate_c.weight, -s, s)
+                torch.nn.init.ones_(block.conv.conv.weight)  # identity-like init for depthwise
+                block.conv.conv.weight.data /= 3.0  # average over kernel
+                torch.nn.init.zeros_(block.conv.out_proj.weight)
+            else:
+                # Attention block init
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+            # MLP init (same for both block types)
             if self.config.mlp_type == "swiglu":
                 torch.nn.init.uniform_(block.mlp.gate.weight, -s * 0.4, s * 0.4)
                 torch.nn.init.uniform_(block.mlp.up.weight, -s * 0.4, s * 0.4)
@@ -409,13 +459,15 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        # AttnRes: extract 1D pseudo-queries from matrix_params (they need AdamW, not Muon)
+        # Extract non-Muon params: 1D (AttnRes pseudo-queries) and 3D (Conv1d depthwise kernels)
+        # Muon only works on 2D matrices
         attn_res_params = []
+        conv_params = [p for p in matrix_params if p.ndim == 3]  # Conv1d weights (d, 1, k)
+        matrix_params = [p for p in matrix_params if p.ndim == 2]  # 2D only for Muon
         if self.config.use_attn_res:
-            attn_res_params = [p for p in matrix_params if p.ndim == 1]
-            matrix_params = [p for p in matrix_params if p.ndim > 1]
+            attn_res_params = [p for p in self.transformer.h.parameters() if p.ndim == 1]
             attn_res_params.append(self.attn_res_q_final)
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_res_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_res_params) + len(conv_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -433,6 +485,9 @@ class GPT(nn.Module):
         # AttnRes pseudo-queries: AdamW with moderate LR
         if attn_res_params:
             param_groups.append(dict(kind='adamw', params=attn_res_params, lr=scalar_lr * 0.02, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        # Conv1d depthwise kernels: AdamW (3D, not compatible with Muon)
+        if conv_params:
+            param_groups.append(dict(kind='adamw', params=conv_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -497,7 +552,7 @@ class GPT(nn.Module):
             partial = x
 
             for i, layer in enumerate(self.transformer.h):
-                # Pre-attention: depth-wise attention over blocks + partial
+                # Pre-attention/conv: depth-wise attention over blocks + partial
                 h = block_attn_res(block_reprs, partial, layer.attn_res_q_attn)
 
                 # Block boundary: store detached partial as completed block
@@ -505,9 +560,12 @@ class GPT(nn.Module):
                     block_reprs.append(partial.detach())
                     partial = torch.zeros_like(x)
 
-                # Self-attention sublayer (with activation checkpointing)
-                attn_out = grad_checkpoint(layer.attn, norm(h), cos_sin, self.window_sizes[i], None, use_reentrant=False)
-                partial = partial + attn_out
+                # Attention or Conv sublayer (with activation checkpointing)
+                if layer.block_type == 'conv':
+                    sub_out = grad_checkpoint(layer.conv, norm(h), use_reentrant=False)
+                else:
+                    sub_out = grad_checkpoint(layer.attn, norm(h), cos_sin, self.window_sizes[i], None, use_reentrant=False)
+                partial = partial + sub_out
 
                 # Pre-MLP: depth-wise attention over blocks + partial
                 h = block_attn_res(block_reprs, partial, layer.attn_res_q_mlp)
@@ -526,7 +584,10 @@ class GPT(nn.Module):
             x0 = x  # save initial normalized embedding for x0 residual
             for i, block in enumerate(self.transformer.h):
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-                x = block(x, cos_sin, self.window_sizes[i], kv_cache)
+                if block.block_type == 'conv':
+                    x = block(x)
+                else:
+                    x = block(x, cos_sin, self.window_sizes[i], kv_cache)
                 if i == backout_layer:
                     x_backout = x
 
