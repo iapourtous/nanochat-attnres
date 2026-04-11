@@ -30,6 +30,22 @@ def _convert_reasoning_core(example):
         return None
     return prompt + "\n" + answer
 
+def _convert_synlogic(example):
+    """Convert SynLogic chat messages to plain text."""
+    prompt = example.get("prompt", [])
+    if not prompt:
+        return None
+    parts = []
+    for msg in prompt:
+        content = msg.get("content", "")
+        if content:
+            parts.append(content)
+    reward = example.get("reward_model", {})
+    answer = reward.get("answer", "") if isinstance(reward, dict) else ""
+    if answer:
+        parts.append(answer)
+    return "\n".join(parts)
+
 DATASETS = {
     "fr": {
         "name": "FineWeb2-HQ French",
@@ -152,6 +168,24 @@ DATASETS = {
         "convert_fn": _convert_reasoning_core,
         "filename": lambda i: f"rcore_{i:04d}.parquet",
         "rows_per_shard": 50000,
+        "hf_download": True,
+    },
+    "synlog-easy": {
+        "name": "SynLogic Easy",
+        "hf_dataset": "MiniMaxAI/SynLogic",
+        "hf_config": "easy",
+        "convert_fn": _convert_synlogic,
+        "filename": lambda i: f"synloge_{i:04d}.parquet",
+        "rows_per_shard": 20000,
+        "hf_download": True,
+    },
+    "synlog-hard": {
+        "name": "SynLogic Hard",
+        "hf_dataset": "MiniMaxAI/SynLogic",
+        "hf_config": "hard",
+        "convert_fn": _convert_synlogic,
+        "filename": lambda i: f"synlogh_{i:04d}.parquet",
+        "rows_per_shard": 35000,
         "hf_download": True,
     },
 }
@@ -335,6 +369,7 @@ if __name__ == "__main__":
     parser.add_argument("--owm", type=int, default=0, help="OpenWebMath shards. -1 = all 150. (~10GB)")
     # Reasoning datasets (HF streaming)
     parser.add_argument("--rcore", type=int, default=0, help="Reasoning-Core SPT shards (50K rows each). -1 = all.")
+    parser.add_argument("--synlog", type=int, default=0, help="SynLogic shards (easy+hard). -1 = all.")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Parallel download workers")
     args = parser.parse_args()
 
@@ -346,6 +381,7 @@ if __name__ == "__main__":
         "mlsum-fr": args.mlsum_fr, "mlsum-en": args.mlsum_en,
         "nemmath": args.nemmath, "owm": args.owm,
         "rcore": args.rcore,
+        "synlog-easy": args.synlog, "synlog-hard": args.synlog,
     }
 
     if all(v == 0 for v in source_counts.values()):
