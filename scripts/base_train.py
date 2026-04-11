@@ -63,6 +63,10 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Attention Residuals (arxiv.org/abs/2603.15031)
 parser.add_argument("--use-attn-res", action="store_true", help="enable Attention Residuals (depth-wise softmax attention over block representations)")
 parser.add_argument("--attn-res-block-size", type=int, default=8, help="AttnRes block size in sublayers (each transformer layer = 2 sublayers)")
+# Curriculum learning
+parser.add_argument("--curriculum", action="store_true", help="enable 2-phase curriculum learning")
+parser.add_argument("--curriculum-phase1-ratio", type=float, default=0.6, help="fraction of steps in phase 1")
+parser.add_argument("--curriculum-transition", type=int, default=2000, help="steps for linear transition between phases")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -352,7 +356,34 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+
+# Curriculum learning setup
+curriculum_step_fn = None
+if args.curriculum:
+    from nanochat.dataloader import CURRICULUM_WEIGHTS
+    _current_step = [0]  # mutable for closure
+    _phase1_end = [None]  # set after num_iterations is known
+
+    def _curriculum_step_fn():
+        step = _current_step[0]
+        phase1_end = _phase1_end[0]
+        if phase1_end is None:
+            return {cat: w[0] for cat, w in CURRICULUM_WEIGHTS.items()}
+        transition = args.curriculum_transition
+        t_start = phase1_end - transition // 2
+        t_end = phase1_end + transition // 2
+        if step < t_start:
+            return {cat: w[0] for cat, w in CURRICULUM_WEIGHTS.items()}
+        elif step > t_end:
+            return {cat: w[1] for cat, w in CURRICULUM_WEIGHTS.items()}
+        else:
+            t = (step - t_start) / transition
+            return {cat: w[0] * (1 - t) + w[1] * t for cat, w in CURRICULUM_WEIGHTS.items()}
+
+    curriculum_step_fn = _curriculum_step_fn
+    print0("Curriculum learning enabled (2-phase)")
+
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, curriculum_step_fn=curriculum_step_fn)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -379,6 +410,10 @@ total_tokens = total_batch_size * num_iterations # the actual number of tokens w
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+
+if args.curriculum:
+    _phase1_end[0] = round(num_iterations * args.curriculum_phase1_ratio)
+    print0(f"Curriculum: phase 1 ends at step {_phase1_end[0]}, transition over {args.curriculum_transition} steps")
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
@@ -540,6 +575,8 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if curriculum_step_fn is not None:
+            _current_step[0] = step
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
