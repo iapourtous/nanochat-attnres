@@ -10,6 +10,7 @@ eval_bundle/
 
 # Local setup
 CLAUDE.md
+.claude/
 wandb/
 autoresearch_results.tsv
 run.log
