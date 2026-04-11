@@ -1,6 +1,6 @@
 # nanochat-attnres
 
-Research fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) exploring **hybrid conv-attention architectures** with **Attention Residuals** ([arxiv.org/abs/2603.15031](https://arxiv.org/abs/2603.15031)) for bilingual French/English LLM pretraining.
+Research fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) exploring **hybrid conv-attention architectures** with **Attention Residuals** ([arxiv.org/abs/2603.15031](https://arxiv.org/abs/2603.15031)) for bilingual French/English LLM pretraining. Optimized for training on **NVIDIA RTX 5090** (32GB).
 
 ## Architecture
 
