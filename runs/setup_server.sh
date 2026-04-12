@@ -98,6 +98,7 @@ uv run --no-sync python -m scripts.base_train \
   --num-iterations=5 \
   --use-attn-res --attn-res-block-size=8 \
   --curriculum \
+  --fp8 --fp8-recipe=tensorwise \
   --run=dummy --save-every=-1 \
   --no-compile
 

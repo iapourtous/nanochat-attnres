@@ -110,6 +110,8 @@ echo ""
     --device-batch-size=${DEVICE_BATCH_SIZE} \
     --total-batch-size=${TOTAL_BATCH_SIZE} \
     --target-param-data-ratio=${TARGET_RATIO} \
+    --fp8 \
+    --fp8-recipe=tensorwise \
     --use-attn-res \
     --attn-res-block-size=${ATTN_RES_BLOCK_SIZE} \
     --curriculum \
