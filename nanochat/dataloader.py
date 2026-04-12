@@ -23,29 +23,31 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-# Curriculum learning: map file prefixes to categories for weighted sampling
+# Curriculum learning: map file prefixes to categories for weighted sampling.
+# docs_ (programming textbooks, only ~0.1B tokens) is intentionally excluded:
+# at any weight > 0 it would be repeated 15x+ at ratio=100 and risk memorisation.
 CATEGORY_MAP = {
     "general": ["fr_", "en_", "wikifr_", "wikien_", "booksfr_", "divfr_", "europarl_"],
     "math": ["nemmath_", "owm_", "arxiv_"],
     "reasoning": ["rcore_", "synloge_", "synlogh_"],
-    "docs": ["docs_"],
 }
 
 # Phase weights: {category: (phase1_weight, phase2_weight)}
+# Tuned for ratio=100 (~93B tokens total) to keep repetition ≤ ~3x on small data.
+# Expected coverage: general ~24%, math ~81%, reasoning ~3.1x repetition.
 CURRICULUM_WEIGHTS = {
-    "general":   (0.50, 0.25),
-    "math":      (0.30, 0.35),
-    "reasoning": (0.15, 0.30),
-    "docs":      (0.05, 0.10),
+    "general":   (0.65, 0.40),
+    "math":      (0.28, 0.45),
+    "reasoning": (0.07, 0.15),
 }
 
 def _categorize_file(filename):
-    """Return the curriculum category for a parquet filename."""
+    """Return the curriculum category for a parquet filename, or None to skip it."""
     for category, prefixes in CATEGORY_MAP.items():
         for prefix in prefixes:
             if filename.startswith(prefix):
                 return category
-    return "general"  # fallback
+    return None  # unknown prefixes (e.g. docs_) are excluded from curriculum sampling
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size, curriculum_step_fn=None):
     """
@@ -64,12 +66,18 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, curriculum
 
     if curriculum_step_fn is not None and split == "train":
         categorized = {}
+        skipped = 0
         for path in parquet_paths:
             cat = _categorize_file(os.path.basename(path))
+            if cat is None:
+                skipped += 1
+                continue
             categorized.setdefault(cat, []).append(path)
         if ddp_rank == 0:
             for cat, paths in sorted(categorized.items()):
                 print(f"  Curriculum [{cat}]: {len(paths)} files")
+            if skipped > 0:
+                print(f"  Curriculum [skipped]: {skipped} files (prefixes not in CATEGORY_MAP)")
         yield from _curriculum_document_batches(
             categorized, tokenizer_batch_size, curriculum_step_fn, ddp_rank, ddp_world_size
         )
