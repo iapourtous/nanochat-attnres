@@ -566,6 +566,11 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # Record AttnRes attention distributions on logging steps (cheap -- only ~0.01% overhead)
+    record_attnres_this_step = args.use_attn_res and (step % 100 == 0)
+    if record_attnres_this_step:
+        from nanochat.gpt import set_attnres_record
+        set_attnres_record(True)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -577,6 +582,9 @@ while True:
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         if curriculum_step_fn is not None:
             _current_step[0] = step
+        # Only record on the first micro_step to keep stats light
+        if record_attnres_this_step and micro_step == 0:
+            set_attnres_record(False)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -638,6 +646,34 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # Learnable scalars (global modulators)
+        with torch.no_grad():
+            log_data["model/smear_lambda"] = float(orig_model.smear_lambda.item())
+            log_data["model/backout_lambda"] = float(orig_model.backout_lambda.item())
+            if args.use_attn_res:
+                log_data["model/attn_res_q_final_norm"] = float(orig_model.attn_res_q_final.norm().item())
+        # Curriculum weights (so we can see the phase transition on wandb)
+        if curriculum_step_fn is not None:
+            for cat, w in curriculum_step_fn().items():
+                log_data[f"curriculum/{cat}"] = float(w)
+        # AttnRes diagnostics: entropy and preferred block per pseudo-query
+        if record_attnres_this_step:
+            from nanochat.gpt import pop_attnres_stats
+            stats = pop_attnres_stats()
+            if stats:
+                import math as _math
+                entropies = []
+                for s in stats:
+                    p = s["attn_mean"].clamp_min(1e-12)
+                    H = float(-(p * p.log()).sum().item())
+                    H_norm = H / _math.log(s["n_blocks"])  # 1.0 = uniform, 0.0 = one-hot
+                    preferred = int(p.argmax().item())
+                    log_data[f"attnres/{s['tag']}/entropy_norm"] = H_norm
+                    log_data[f"attnres/{s['tag']}/preferred_block"] = preferred
+                    entropies.append(H_norm)
+                if entropies:
+                    log_data["attnres/entropy_norm_mean"] = sum(entropies) / len(entropies)
+                    log_data["attnres/entropy_norm_min"] = min(entropies)
         wandb_run.log(log_data)
 
     # state update

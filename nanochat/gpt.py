@@ -49,7 +49,25 @@ class GPTConfig:
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
-def block_attn_res(block_reprs, partial, query):
+# Diagnostic: opt-in capture of AttnRes softmax distributions for wandb logging.
+# When _ATTNRES_RECORD is True, each call to block_attn_res appends to _ATTNRES_STATS.
+# Call pop_attnres_stats() to retrieve and clear.
+_ATTNRES_RECORD = False
+_ATTNRES_STATS = []  # list of dicts: {tag, attn_mean (N+1,), n_blocks}
+
+
+def set_attnres_record(enable: bool):
+    global _ATTNRES_RECORD
+    _ATTNRES_RECORD = enable
+
+
+def pop_attnres_stats():
+    global _ATTNRES_STATS
+    out, _ATTNRES_STATS = _ATTNRES_STATS, []
+    return out
+
+
+def block_attn_res(block_reprs, partial, query, tag=None):
     """
     Depth-wise softmax attention over block representations (Attention Residuals).
     Block representations are detached (no gradient) — gradients flow through partial only.
@@ -58,6 +76,7 @@ def block_attn_res(block_reprs, partial, query):
         block_reprs: list of (B, T, D) tensors — completed block sums (detached)
         partial: (B, T, D) — current intra-block partial sum (has gradient)
         query: (D,) — learned pseudo-query for this depth position
+        tag: optional string id for this call, used when recording diagnostics
     Returns:
         (B, T, D) — attention-weighted aggregation
     """
@@ -67,6 +86,13 @@ def block_attn_res(block_reprs, partial, query):
     K = F.rms_norm(V, (V.size(-1),))
     logits = torch.einsum('d, nbtd -> nbt', query.to(K.dtype), K)
     attn = F.softmax(logits, dim=0)
+    if _ATTNRES_RECORD and tag is not None:
+        with torch.no_grad():
+            _ATTNRES_STATS.append({
+                'tag': tag,
+                'attn_mean': attn.mean(dim=(1, 2)).detach().to(torch.float32).cpu(),  # (N+1,)
+                'n_blocks': V.size(0),
+            })
     return torch.einsum('nbt, nbtd -> btd', attn, V)
 
 
@@ -553,7 +579,7 @@ class GPT(nn.Module):
 
             for i, layer in enumerate(self.transformer.h):
                 # Pre-attention/conv: depth-wise attention over blocks + partial
-                h = block_attn_res(block_reprs, partial, layer.attn_res_q_attn)
+                h = block_attn_res(block_reprs, partial, layer.attn_res_q_attn, tag=f"L{i:02d}_attn")
 
                 # Block boundary: store detached partial as completed block
                 if i % layers_per_block == 0:
@@ -568,17 +594,17 @@ class GPT(nn.Module):
                 partial = partial + sub_out
 
                 # Pre-MLP: depth-wise attention over blocks + partial
-                h = block_attn_res(block_reprs, partial, layer.attn_res_q_mlp)
+                h = block_attn_res(block_reprs, partial, layer.attn_res_q_mlp, tag=f"L{i:02d}_mlp")
 
                 # MLP sublayer (with activation checkpointing)
                 mlp_out = grad_checkpoint(layer.mlp, norm(h), use_reentrant=False)
                 partial = partial + mlp_out
 
                 if i == backout_layer:
-                    x_backout = block_attn_res(block_reprs, partial, self.attn_res_q_final)
+                    x_backout = block_attn_res(block_reprs, partial, self.attn_res_q_final, tag="backout")
 
             # Final aggregation
-            x = block_attn_res(block_reprs, partial, self.attn_res_q_final)
+            x = block_attn_res(block_reprs, partial, self.attn_res_q_final, tag="final")
         else:
             # --- Standard residual path (original nanochat) ---
             x0 = x  # save initial normalized embedding for x0 residual
