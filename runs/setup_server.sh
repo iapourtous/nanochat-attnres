@@ -86,15 +86,19 @@ echo ""
 echo "[4/5] Training bilingual tokenizer..."
 uv run --no-sync python -m scripts.tok_train --max-chars 2000000000 --vocab-size 32768
 
-# 5. Quick sanity check
+# 5. Quick sanity check -- uses the same architecture as runs/train.sh
+#    (hybrid conv+attention SSSL, AttnRes, SwiGLU, curriculum) at miniature scale
 echo ""
-echo "[5/5] Sanity check (5 steps, no compile)..."
+echo "[5/5] Sanity check (5 steps, hybrid SSSL, no compile)..."
 uv run --no-sync python -m scripts.base_train \
-  --depth=4 --max-seq-len=512 \
+  --depth=8 --max-seq-len=512 \
+  --mlp-type=swiglu \
+  --window-pattern=SSSL \
   --device-batch-size=4 --total-batch-size=2048 \
   --num-iterations=5 \
-  --use-attn-res --attn-res-block-size=4 \
-  --window-pattern=L --run=dummy --save-every=-1 \
+  --use-attn-res --attn-res-block-size=8 \
+  --curriculum \
+  --run=dummy --save-every=-1 \
   --no-compile
 
 echo ""
