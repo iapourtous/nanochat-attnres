@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# Full training: nanochat + AttnRes v3 hybrid conv+attention (~978M params)
+# Full training: nanochat + AttnRes v3 hybrid conv+attention (~1.5B params)
 # Target: 1x NVIDIA DGX Spark (GB10 Blackwell, 128GB unified memory, aarch64)
-# Architecture: 19 conv + 7 attention layers (pattern SSSL, depth 26)
+# Architecture: 24 conv + 8 attention layers (pattern SSSL, depth 32)
 # Usage:
 #   tmux new -s train
 #   bash runs/train.sh
@@ -32,21 +32,21 @@ if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
 fi
 
-# Model config — Hybrid Conv+AttnRes
-DEPTH=26
+# Model config — Hybrid Conv+AttnRes (depth 32 ~1.5B params, nudged up from 26/~978M)
+DEPTH=32
 ASPECT_RATIO=48
+# 32 * 48 = 1536 (exact multiple of head_dim=128) → n_head=12, n_kv_head=3 (GQA 4:1)
 N_KV_HEAD=3
 INTERMEDIATE_SIZE=4480
 MLP_TYPE=swiglu
 ROPE_BASE=1000000
 ATTN_RES_BLOCK_SIZE=8
 MAX_SEQ_LEN=2048
-# DGX Spark has 128GB unified memory -- much more headroom than RTX 5090 (32GB).
-# Start moderate (16); can go up to 32 if memory allows. Stay below 80GB peak
-# to leave room for the OS, SSH, and other processes.
-DEVICE_BATCH_SIZE=16
-# 16 * 2048 = 32768, 524288 / 32768 = 16 exact
-TOTAL_BATCH_SIZE=524288
+# DGX Spark has 128GB unified memory. Cap at 10 to stay well under 80GB peak
+# (leaves room for OS + SSH + watchdog, avoids unified-memory OOM freeze).
+DEVICE_BATCH_SIZE=10
+# 10 * 2048 = 20480, 512000 / 20480 = 25 exact
+TOTAL_BATCH_SIZE=512000
 WINDOW_PATTERN=SSSL
 # Training ratio:
 #   150 = ~92B tokens, good compromise
@@ -55,8 +55,8 @@ TARGET_RATIO=150
 RUN_NAME="attnres-v3-dgxspark-d${DEPTH}"
 
 echo "============================================="
-echo " nanochat + AttnRes v3 Hybrid (~978M params)"
-echo " 19 conv + 7 attention (pattern: ${WINDOW_PATTERN})"
+echo " nanochat + AttnRes v3 Hybrid (~1.5B params)"
+echo " 24 conv + 8 attention (pattern: ${WINDOW_PATTERN})"
 echo " depth=${DEPTH} | d_model=$((DEPTH * ASPECT_RATIO))"
 echo " DGX Spark GB10 | batch=${DEVICE_BATCH_SIZE}"
 echo "============================================="
