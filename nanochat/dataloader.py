@@ -144,20 +144,57 @@ def _curriculum_document_batches(categorized, tokenizer_batch_size, curriculum_s
         yield batch, (pq_idx, rg_idx, epoch)
 
 
-def _cycle_parquet_files(paths, ddp_rank, ddp_world_size, tokenizer_batch_size):
-    """Infinite iterator over documents from a list of parquet files."""
+def _cycle_parquet_files(paths, ddp_rank, ddp_world_size, tokenizer_batch_size, n_parallel=8):
+    """Infinite iterator over documents from a list of parquet files.
+
+    Maintains up to `n_parallel` shard readers open simultaneously and picks
+    a random one at each yield, so documents from different shards are strongly
+    interleaved. This breaks temporal correlation within a category (otherwise
+    the model would see ~500 consecutive steps of docs from a single shard).
+
+    The random state is seeded deterministically (same across DDP ranks), so
+    all ranks select the same shard at the same time. Ranks still split
+    row_groups within a shard by rank (rg_idx += ddp_world_size).
+    """
+    import random
+    rng = random.Random(42)
+
+    def _shard_iter(filepath, pq_idx, epoch):
+        """Yield (text_batch, indices) from one shard."""
+        pf = pq.ParquetFile(filepath)
+        rg_idx = ddp_rank
+        while rg_idx < pf.num_row_groups:
+            rg = pf.read_row_group(rg_idx, columns=['text'])
+            batch = rg.column('text').to_pylist()
+            for i in range(0, len(batch), tokenizer_batch_size):
+                yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
+            rg_idx += ddp_world_size
+
+    # Start with a shuffled path queue; on epoch end, reshuffle and continue
     epoch = 1
-    while True:
-        for pq_idx, filepath in enumerate(paths):
-            pf = pq.ParquetFile(filepath)
-            rg_idx = ddp_rank
-            while rg_idx < pf.num_row_groups:
-                rg = pf.read_row_group(rg_idx, columns=['text'])
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += ddp_world_size
-        epoch += 1
+    queue = list(enumerate(paths))
+    rng.shuffle(queue)
+
+    def open_next_shard():
+        nonlocal epoch, queue
+        if not queue:
+            epoch += 1
+            queue = list(enumerate(paths))
+            rng.shuffle(queue)
+        pq_idx, filepath = queue.pop()
+        return _shard_iter(filepath, pq_idx, epoch)
+
+    # Fill the pool of active shard readers
+    pool_size = min(n_parallel, len(paths))
+    active = [open_next_shard() for _ in range(pool_size)]
+
+    while active:
+        slot = rng.randrange(len(active))
+        try:
+            yield next(active[slot])
+        except StopIteration:
+            # Shard exhausted -- swap in the next one
+            active[slot] = open_next_shard()
 
 
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
