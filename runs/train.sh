@@ -1,11 +1,21 @@
 #!/bin/bash
 # =============================================================================
 # Full training: nanochat + AttnRes v3 hybrid conv+attention (~978M params)
-# Target: 1x RTX 5090 32GB
-# Architecture: 24 conv + 8 attention layers (pattern SSSL)
+# Target: 1x NVIDIA DGX Spark (GB10 Blackwell, 128GB unified memory, aarch64)
+# Architecture: 19 conv + 7 attention layers (pattern SSSL, depth 26)
 # Usage:
 #   tmux new -s train
 #   bash runs/train.sh
+#
+# DGX Spark notes:
+#   - Unified 128GB memory: GPU OOM = system OOM. Swap must be disabled
+#     (done by setup_server.sh) to avoid freezing the machine.
+#   - Flash Attention 3 is NOT available on Blackwell; SDPA fallback runs
+#     automatically and is actually faster on GB10.
+#   - sm_120 kernels (in cu128 wheels) are binary-compatible with sm_121 (GB10).
+#     You will see a "sm_121 not supported" warning -- safe to ignore.
+#   - torch.compile disabled by default: first-step compile on ARM can be slow
+#     and occasionally flaky. Remove --no-compile if you want to try it.
 # =============================================================================
 set -e
 
@@ -14,7 +24,11 @@ source .venv/bin/activate
 
 # Env
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export WANDB_API_KEY=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
+export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+export TORCH_CUDA_ARCH_LIST="12.0"   # sm_120 is binary-compatible with sm_121 (GB10)
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+fi
 
 # Model config — Hybrid Conv+AttnRes
 DEPTH=26
@@ -25,21 +39,24 @@ MLP_TYPE=swiglu
 ROPE_BASE=1000000
 ATTN_RES_BLOCK_SIZE=8
 MAX_SEQ_LEN=2048
-DEVICE_BATCH_SIZE=5
-# 5 * 2048 = 10240, 522240 / 10240 = 51 exact
-TOTAL_BATCH_SIZE=522240
+# DGX Spark has 128GB unified memory -- much more headroom than RTX 5090 (32GB).
+# Start moderate (16); can go up to 32 if memory allows. Stay below 80GB peak
+# to leave room for the OS, SSH, and other processes.
+DEVICE_BATCH_SIZE=16
+# 16 * 2048 = 32768, 524288 / 32768 = 16 exact
+TOTAL_BATCH_SIZE=524288
 WINDOW_PATTERN=SSSL
 # Training ratio:
-#   150 = ~92B tokens, good compromise (~52 days on 1x RTX 5090, ~5 days on 12x)
-#   483 = ALL data (~295B tokens, ~126 days on 1x, ~10 days on 12x)
+#   150 = ~92B tokens, good compromise
+#   483 = ALL data (~295B tokens)
 TARGET_RATIO=150
-RUN_NAME="attnres-v3-curriculum-d${DEPTH}"
+RUN_NAME="attnres-v3-dgxspark-d${DEPTH}"
 
 echo "============================================="
 echo " nanochat + AttnRes v3 Hybrid (~978M params)"
-echo " 24 conv + 8 attention (pattern: ${WINDOW_PATTERN})"
+echo " 19 conv + 7 attention (pattern: ${WINDOW_PATTERN})"
 echo " depth=${DEPTH} | d_model=$((DEPTH * ASPECT_RATIO))"
-echo " RTX 5090 | batch=${DEVICE_BATCH_SIZE}"
+echo " DGX Spark GB10 | batch=${DEVICE_BATCH_SIZE}"
 echo "============================================="
 
 # Check data
@@ -51,6 +68,13 @@ echo "Dataset: ${SHARD_COUNT} shards"
 if [ ! -f "$HOME/.cache/nanochat/tokenizer/tokenizer.pkl" ]; then
     echo "ERROR: No tokenizer found. Run setup_server.sh first."
     exit 1
+fi
+
+# Check swap is off (to prevent OOM freeze of the whole machine)
+if [ "$(swapon --show)" != "" ]; then
+    echo "WARNING: Swap is enabled. On DGX Spark's unified memory, an OOM can"
+    echo "         freeze the machine via a swap-death-spiral. Consider:"
+    echo "           sudo swapoff -a"
 fi
 
 echo "Starting training..."
@@ -74,4 +98,5 @@ python -m scripts.base_train \
     --curriculum-phase1-ratio=0.6 \
     --curriculum-transition=2000 \
     --run="${RUN_NAME}" \
-    --save-every=10000
+    --save-every=10000 \
+    --no-compile
