@@ -48,10 +48,12 @@ DEVICE_BATCH_SIZE=10
 # 10 * 2048 = 20480, 512000 / 20480 = 25 exact
 TOTAL_BATCH_SIZE=512000
 WINDOW_PATTERN=SSSL
-# Training ratio:
-#   150 = ~92B tokens, good compromise
-#   483 = ALL data (~295B tokens)
-TARGET_RATIO=150
+# Training ratio (recomputed for d32, scaling_params ≈ 930M):
+#   30   = ~28B tokens  (~9% of data, Chinchilla-style compute-optimal)
+#   100  = ~93B tokens  (~31% of data, same compute budget as d26@150)
+#   150  = ~140B tokens (~46% of data)
+#   325  = ~302B tokens (ALL data, ~1 full epoch over the whole dataset)
+TARGET_RATIO=100
 RUN_NAME="attnres-v3-dgxspark-d${DEPTH}"
 
 echo "============================================="
@@ -79,10 +81,24 @@ if [ "$(swapon --show)" != "" ]; then
     echo "           sudo swapoff -a"
 fi
 
+# Auto-resume: if a checkpoint exists for this depth, resume from the latest step.
+CHECKPOINT_DIR="$HOME/.cache/nanochat/base_checkpoints/d${DEPTH}"
+RESUME_ARGS=""
+if [ -d "$CHECKPOINT_DIR" ]; then
+    LAST_STEP=$(ls "$CHECKPOINT_DIR"/model_*.pt 2>/dev/null \
+                | sed -E 's/.*model_0*([0-9]+)\.pt/\1/' \
+                | sort -n | tail -1)
+    if [ -n "$LAST_STEP" ]; then
+        echo "Found checkpoint at step $LAST_STEP -- resuming"
+        RESUME_ARGS="--resume-from-step=$LAST_STEP"
+    fi
+fi
+
 echo "Starting training..."
 echo ""
 
 .venv/bin/python -m scripts.base_train \
+    $RESUME_ARGS \
     --depth=${DEPTH} \
     --aspect-ratio=${ASPECT_RATIO} \
     --n-kv-head=${N_KV_HEAD} \
