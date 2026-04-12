@@ -14,8 +14,8 @@
 #     automatically and is actually faster on GB10.
 #   - sm_120 kernels (in cu128 wheels) are binary-compatible with sm_121 (GB10).
 #     You will see a "sm_121 not supported" warning -- safe to ignore.
-#   - torch.compile disabled by default: first-step compile on ARM can be slow
-#     and occasionally flaky. Remove --no-compile if you want to try it.
+#   - torch.compile enabled by default: first compile takes 10-30 min but pays
+#     back 30-50% on the long training run. Add --no-compile if it fails.
 # =============================================================================
 set -e
 
@@ -116,5 +116,4 @@ echo ""
     --curriculum-phase1-ratio=0.6 \
     --curriculum-transition=2000 \
     --run="${RUN_NAME}" \
-    --save-every=10000 \
-    --no-compile
+    --save-every=10000
