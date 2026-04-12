@@ -20,6 +20,8 @@
 set -e
 
 cd "$(dirname "$0")/.."
+# Make sure uv is on PATH
+[ -f "$HOME/.local/bin/env" ] && source "$HOME/.local/bin/env"
 source .venv/bin/activate
 
 # Env
@@ -80,7 +82,7 @@ fi
 echo "Starting training..."
 echo ""
 
-python -m scripts.base_train \
+.venv/bin/python -m scripts.base_train \
     --depth=${DEPTH} \
     --aspect-ratio=${ASPECT_RATIO} \
     --n-kv-head=${N_KV_HEAD} \

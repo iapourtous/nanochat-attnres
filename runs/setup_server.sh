@@ -46,13 +46,13 @@ uv pip install --pre --force-reinstall \
 
 echo ""
 echo "  Verifying CUDA is available..."
-CUDA_OK=$(uv run python -c "import torch; print('yes' if torch.cuda.is_available() else 'no')" 2>/dev/null || echo "no")
+CUDA_OK=$(uv run --no-sync python -c "import torch; print('yes' if torch.cuda.is_available() else 'no')" 2>/dev/null || echo "no")
 if [ "$CUDA_OK" != "yes" ]; then
     echo "  ERROR: PyTorch still does not see CUDA after nightly install."
-    echo "         Debug: uv run python -c 'import torch; print(torch.__version__)'"
+    echo "         Debug: uv run --no-sync python -c 'import torch; print(torch.__version__)'"
     exit 1
 fi
-uv run python -c "
+uv run --no-sync python -c "
 import torch
 print(f'  torch: {torch.__version__}')
 print(f'  CUDA:  {torch.version.cuda}')
@@ -66,7 +66,7 @@ echo "[3/5] Downloading datasets..."
 if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
 fi
-uv run python -m nanochat.dataset \
+uv run --no-sync python -m nanochat.dataset \
   --fr -1 --en 170 \
   --wiki-fr -1 --wiki-en -1 \
   --books-fr -1 --diverse-fr -1 \
@@ -75,7 +75,7 @@ uv run python -m nanochat.dataset \
 
 echo ""
 echo "  Downloading STEM datasets (curriculum learning)..."
-uv run python3 scripts/download_data.py \
+uv run --no-sync python scripts/download_data.py \
   --nemmath -1 --owm -1 \
   --rcore -1 --synlog -1 \
   --docs -1 \
@@ -84,12 +84,12 @@ uv run python3 scripts/download_data.py \
 # 4. Train tokenizer on the full bilingual + STEM mix (deterministic shuffle)
 echo ""
 echo "[4/5] Training bilingual tokenizer..."
-uv run python -m scripts.tok_train --max-chars 2000000000 --vocab-size 32768
+uv run --no-sync python -m scripts.tok_train --max-chars 2000000000 --vocab-size 32768
 
 # 5. Quick sanity check
 echo ""
 echo "[5/5] Sanity check (5 steps, no compile)..."
-uv run python -m scripts.base_train \
+uv run --no-sync python -m scripts.base_train \
   --depth=4 --max-seq-len=512 \
   --device-batch-size=4 --total-batch-size=2048 \
   --num-iterations=5 \
