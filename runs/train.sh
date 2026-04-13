@@ -1,21 +1,20 @@
 #!/bin/bash
 # =============================================================================
-# Full training: nanochat + AttnRes v3 hybrid conv+attention (~1.5B params)
-# Target: 1x NVIDIA DGX Spark (GB10 Blackwell, 128GB unified memory, aarch64)
+# Full training: nanochat + AttnRes v3 hybrid conv+attention (~978M params)
+# Target: 1x NVIDIA H100 SXM (80GB HBM3, Hopper sm_90, x86_64)
 # Architecture: 24 conv + 8 attention layers (pattern SSSL, depth 32)
 # Usage:
 #   tmux new -s train
 #   bash runs/train.sh
 #
-# DGX Spark notes:
-#   - Unified 128GB memory: GPU OOM = system OOM. Swap must be disabled
-#     (done by setup_server.sh) to avoid freezing the machine.
-#   - Flash Attention 3 is NOT available on Blackwell; SDPA fallback runs
-#     automatically and is actually faster on GB10.
-#   - sm_120 kernels (in cu128 wheels) are binary-compatible with sm_121 (GB10).
-#     You will see a "sm_121 not supported" warning -- safe to ignore.
-#   - torch.compile enabled by default: first compile takes 10-30 min but pays
-#     back 30-50% on the long training run. Add --no-compile if it fails.
+# H100 notes:
+#   - Flash Attention 3 (FA3) is NATIVE on Hopper -- massive speedup for the
+#     8 attention layers. Already picked up by nanochat/flash_attention.py.
+#   - FP8 (E4M3 fwd, E5M2 bwd) via torch._scaled_mm -- H100 has FP8 tensor cores,
+#     gives ~1.5-2x speedup over BF16.
+#   - HBM3 bandwidth 3350 GB/s (~12x DGX Spark) -- training is no longer
+#     bandwidth-bound, compute-bound with FA3.
+#   - torch.compile enabled: first compile 10-30 min, then ~30% speedup.
 # =============================================================================
 set -e
 
@@ -26,13 +25,11 @@ source .venv/bin/activate
 
 # Env
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
-export TORCH_CUDA_ARCH_LIST="12.0"   # sm_120 is binary-compatible with sm_121 (GB10)
 if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
 fi
 
-# Model config — Hybrid Conv+AttnRes (depth 32 ~1.5B params, nudged up from 26/~978M)
+# Model config — Hybrid Conv+AttnRes (depth 32, ~978M params)
 DEPTH=32
 ASPECT_RATIO=48
 # 32 * 48 = 1536 (exact multiple of head_dim=128) → n_head=12, n_kv_head=3 (GQA 4:1)
@@ -42,25 +39,24 @@ MLP_TYPE=swiglu
 ROPE_BASE=1000000
 ATTN_RES_BLOCK_SIZE=8
 MAX_SEQ_LEN=2048
-# DGX Spark has 128GB unified memory. Cap at 10 to stay well under 80GB peak
-# (leaves room for OS + SSH + watchdog, avoids unified-memory OOM freeze).
-DEVICE_BATCH_SIZE=10
-# 10 * 2048 = 20480, 512000 / 20480 = 25 exact
-TOTAL_BATCH_SIZE=512000
+# H100 80GB HBM3. With FP8 + activation checkpointing, 32 fits easily.
+# 32 * 2048 = 65536 tokens/micro-batch, 524288/65536 = 8 grad_accum exact.
+DEVICE_BATCH_SIZE=32
+TOTAL_BATCH_SIZE=524288
 WINDOW_PATTERN=SSSL
-# Training ratio (recomputed for d32, scaling_params ≈ 930M):
-#   30   = ~28B tokens  (~9% of data, Chinchilla-style compute-optimal)
-#   100  = ~93B tokens  (~31% of data, same compute budget as d26@150)
+# Training ratio (scaling_params ≈ 928M for d32):
+#   30   = ~28B tokens  (Chinchilla-style compute-optimal, fastest)
+#   100  = ~93B tokens  (~31% of data, good baseline)
 #   150  = ~140B tokens (~46% of data)
-#   325  = ~302B tokens (ALL data, ~1 full epoch over the whole dataset)
+#   325  = ~302B tokens (ALL data, ~1 full epoch)
 TARGET_RATIO=100
-RUN_NAME="attnres-v3-dgxspark-d${DEPTH}"
+RUN_NAME="attnres-v3-h100-d${DEPTH}"
 
 echo "============================================="
-echo " nanochat + AttnRes v3 Hybrid (~1.5B params)"
+echo " nanochat + AttnRes v3 Hybrid (~978M params)"
 echo " 24 conv + 8 attention (pattern: ${WINDOW_PATTERN})"
 echo " depth=${DEPTH} | d_model=$((DEPTH * ASPECT_RATIO))"
-echo " DGX Spark GB10 | batch=${DEVICE_BATCH_SIZE}"
+echo " H100 SXM 80GB HBM3 | batch=${DEVICE_BATCH_SIZE}"
 echo "============================================="
 
 # Check data
@@ -72,13 +68,6 @@ echo "Dataset: ${SHARD_COUNT} shards"
 if [ ! -f "$HOME/.cache/nanochat/tokenizer/tokenizer.pkl" ]; then
     echo "ERROR: No tokenizer found. Run setup_server.sh first."
     exit 1
-fi
-
-# Check swap is off (to prevent OOM freeze of the whole machine)
-if [ "$(swapon --show)" != "" ]; then
-    echo "WARNING: Swap is enabled. On DGX Spark's unified memory, an OOM can"
-    echo "         freeze the machine via a swap-death-spiral. Consider:"
-    echo "           sudo swapoff -a"
 fi
 
 # Auto-resume: if a checkpoint exists for this depth, resume from the latest step.
