@@ -13,15 +13,35 @@ from functools import lru_cache
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
     "<|bos|>",
-    # tokens below are only used during finetuning to render Conversations into token ids
-    "<|user_start|>", # user messages
-    "<|user_end|>",
-    "<|assistant_start|>", # assistant messages
-    "<|assistant_end|>",
-    "<|python_start|>", # assistant invokes python REPL tool
-    "<|python_end|>",
-    "<|output_start|>", # python REPL outputs back to assistant
-    "<|output_end|>",
+    # Context wrapper (grounded QA, RAG, instruct input)
+    "<|context_start|>", "<|context_end|>",
+    # Input wrapper (the instruction/question to answer)
+    "<|input_start|>", "<|input_end|>",
+    # Task triggers (dispatch to specialized Talker after Phase 3)
+    "<|qa|>",
+    "<|extract_json|>",
+    "<|extract_triples|>",
+    "<|classify|>",
+    "<|summarize|>",
+    # Reasoning structure (chain-of-thought markers)
+    "<|think_start|>", "<|think_end|>",
+    "<|answer_start|>", "<|answer_end|>",
+    "<|no_answer|>",                                # "not in context" sentinel
+    # Structured outputs (Talker-specific)
+    "<|json_start|>", "<|json_end|>",
+    "<|triple_start|>", "<|triple_end|>",
+    "<|class_start|>", "<|class_end|>",
+    "<|summary_start|>", "<|summary_end|>",
+    # Generic code wrapper (used when context contains code or outputs code)
+    "<|code_start|>", "<|code_end|>",
+    # Metadata / grounding
+    "<|citation_start|>", "<|citation_end|>",
+    "<|uncertain|>",
+    # JEPA Phase 3 (latent placeholder)
+    "<|latent|>",
+    # Reserved for future use (avoid retokenization)
+    "<|reserved_0|>", "<|reserved_1|>", "<|reserved_2|>", "<|reserved_3|>",
+    "<|reserved_4|>", "<|reserved_5|>", "<|reserved_6|>", "<|reserved_7|>",
 ]
 
 # NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
@@ -263,126 +283,109 @@ class RustBPETokenizer:
             pickle.dump(self.enc, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
 
-    def render_conversation(self, conversation, max_tokens=2048):
+    def render_instruct_sample(self, sample, max_tokens=2048):
         """
-        Tokenize a single Chat conversation (which we call a "doc" or "document" here).
+        Tokenize a single instruct-style sample. This project is instruct-only
+        (never chat), so no user/assistant turns -- instead we have a task
+        trigger, context, input (question/instruction), and structured output.
+
+        sample dict fields (all optional except `task`):
+          - task: str, one of {"qa", "extract_json", "extract_triples", "classify", "summarize"}
+          - context: str (wrapped in <|context_start|>...<|context_end|>)
+          - input: str  (wrapped in <|input_start|>...<|input_end|>)
+          - think: str  (reasoning, wrapped in <|think_start|>...<|think_end|>, trained on)
+          - output: str (the final answer, wrapped in the task-specific marker, trained on)
+          - no_answer: bool (if True, emits <|no_answer|> instead of output)
+
         Returns:
-        - ids: list[int] is a list of token ids of this rendered conversation
-        - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
+          - ids:  list[int] tokens
+          - mask: list[int] 1 for tokens trained on (think + output), 0 elsewhere
         """
-        # ids, masks that we will return and a helper function to help build them up.
+        TASK_TO_OUTPUT_WRAPPER = {
+            "qa":              ("<|answer_start|>", "<|answer_end|>"),
+            "extract_json":    ("<|json_start|>", "<|json_end|>"),
+            "extract_triples": ("<|triple_start|>", "<|triple_end|>"),
+            "classify":        ("<|class_start|>", "<|class_end|>"),
+            "summarize":       ("<|summary_start|>", "<|summary_end|>"),
+        }
+        task = sample["task"]
+        assert task in TASK_TO_OUTPUT_WRAPPER, f"Unknown task: {task}"
+
         ids, mask = [], []
-        def add_tokens(token_ids, mask_val):
-            if isinstance(token_ids, int):
-                token_ids = [token_ids]
-            ids.extend(token_ids)
-            mask.extend([mask_val] * len(token_ids))
+        def add(token_or_ids, mask_val):
+            if isinstance(token_or_ids, int):
+                token_or_ids = [token_or_ids]
+            ids.extend(token_or_ids)
+            mask.extend([mask_val] * len(token_or_ids))
 
-        # sometimes the first message is a system message...
-        # => just merge it with the second (user) message
-        if conversation["messages"][0]["role"] == "system":
-            # some conversation surgery is necessary here for now...
-            conversation = copy.deepcopy(conversation) # avoid mutating the original
-            messages = conversation["messages"]
-            assert messages[1]["role"] == "user", "System message must be followed by a user message"
-            messages[1]["content"] = messages[0]["content"] + "\n\n" + messages[1]["content"]
-            messages = messages[1:]
-        else:
-            messages = conversation["messages"]
-        assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
-
-        # fetch all the special tokens we need
         bos = self.get_bos_token_id()
-        user_start, user_end = self.encode_special("<|user_start|>"), self.encode_special("<|user_end|>")
-        assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
-        python_start, python_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
-        output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
+        enc = self.encode_special
+        out_start, out_end = TASK_TO_OUTPUT_WRAPPER[task]
 
-        # now we can tokenize the conversation
-        add_tokens(bos, 0)
-        for i, message in enumerate(messages):
+        add(bos, 0)
+        # Context (optional)
+        if sample.get("context"):
+            add(enc("<|context_start|>"), 0)
+            add(self.encode(sample["context"]), 0)
+            add(enc("<|context_end|>"), 0)
+        # Task trigger
+        add(enc(f"<|{task}|>"), 0)
+        # Input (optional, e.g. the question for QA)
+        if sample.get("input"):
+            add(enc("<|input_start|>"), 0)
+            add(self.encode(sample["input"]), 0)
+            add(enc("<|input_end|>"), 0)
+        # Think (optional, but trained on when present)
+        if sample.get("think"):
+            add(enc("<|think_start|>"), 1)
+            add(self.encode(sample["think"]), 1)
+            add(enc("<|think_end|>"), 1)
+        # Output
+        if sample.get("no_answer"):
+            add(enc("<|no_answer|>"), 1)
+        else:
+            add(enc(out_start), 1)
+            add(self.encode(sample["output"]), 1)
+            add(enc(out_end), 1)
 
-            # some sanity checking here around assumptions, to prevent footguns
-            must_be_from = "user" if i % 2 == 0 else "assistant"
-            assert message["role"] == must_be_from, f"Message {i} is from {message['role']} but should be from {must_be_from}"
-
-            # content can be either a simple string or a list of parts (e.g. containing tool calls)
-            content = message["content"]
-
-            if message["role"] == "user":
-                assert isinstance(content, str), "User messages are simply expected to be strings"
-                value_ids = self.encode(content)
-                add_tokens(user_start, 0)
-                add_tokens(value_ids, 0)
-                add_tokens(user_end, 0)
-            elif message["role"] == "assistant":
-                add_tokens(assistant_start, 0)
-                if isinstance(content, str):
-                    # simple string => simply add the tokens
-                    value_ids = self.encode(content)
-                    add_tokens(value_ids, 1)
-                elif isinstance(content, list):
-                    for part in content:
-                        value_ids = self.encode(part["text"])
-                        if part["type"] == "text":
-                            # string part => simply add the tokens
-                            add_tokens(value_ids, 1)
-                        elif part["type"] == "python":
-                            # python tool call => add the tokens inside <|python_start|> and <|python_end|>
-                            add_tokens(python_start, 1)
-                            add_tokens(value_ids, 1)
-                            add_tokens(python_end, 1)
-                        elif part["type"] == "python_output":
-                            # python output => add the tokens inside <|output_start|> and <|output_end|>
-                            # none of these tokens are supervised because the tokens come from Python at test time
-                            add_tokens(output_start, 0)
-                            add_tokens(value_ids, 0)
-                            add_tokens(output_end, 0)
-                        else:
-                            raise ValueError(f"Unknown part type: {part['type']}")
-                else:
-                    raise ValueError(f"Unknown content type: {type(content)}")
-                add_tokens(assistant_end, 1)
-
-        # truncate to max_tokens tokens MAX (helps prevent OOMs)
         ids = ids[:max_tokens]
         mask = mask[:max_tokens]
         return ids, mask
 
+    def render_for_completion(self, sample):
+        """Render an instruct sample WITHOUT the output (for inference priming).
+
+        Useful during generation and RL: we want the model to fill in the output
+        after we've given it context + task trigger + input + (optionally) think.
+        """
+        sample = {k: v for k, v in sample.items() if k not in ("output", "no_answer")}
+        # Render with a dummy output stripped off, then trim everything past the task
+        # trigger / input. Easiest: build the prefix manually.
+        ids = []
+        enc = self.encode_special
+        ids.append(self.get_bos_token_id())
+        if sample.get("context"):
+            ids.append(enc("<|context_start|>"))
+            ids.extend(self.encode(sample["context"]))
+            ids.append(enc("<|context_end|>"))
+        ids.append(enc(f"<|{sample['task']}|>"))
+        if sample.get("input"):
+            ids.append(enc("<|input_start|>"))
+            ids.extend(self.encode(sample["input"]))
+            ids.append(enc("<|input_end|>"))
+        return ids
+
     def visualize_tokenization(self, ids, mask, with_token_id=False):
-        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
-        RED = '\033[91m'
-        GREEN = '\033[92m'
-        RESET = '\033[0m'
-        GRAY = '\033[90m'
+        """Visualize tokenization: green = trained on, red = not trained on."""
+        RED, GREEN, RESET, GRAY = '\033[91m', '\033[92m', '\033[0m', '\033[90m'
         tokens = []
-        for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
+        for token_id, mask_val in zip(ids, mask):
             token_str = self.decode([token_id])
             color = GREEN if mask_val == 1 else RED
             tokens.append(f"{color}{token_str}{RESET}")
             if with_token_id:
                 tokens.append(f"{GRAY}({token_id}){RESET}")
         return '|'.join(tokens)
-
-    def render_for_completion(self, conversation):
-        """
-        Used during Reinforcement Learning. In that setting, we want to
-        render the conversation priming the Assistant for a completion.
-        Unlike the Chat SFT case, we don't need to return the mask.
-        """
-        # We have some surgery to do: we need to pop the last message (of the Assistant)
-        conversation = copy.deepcopy(conversation) # avoid mutating the original
-        messages = conversation["messages"]
-        assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
-        messages.pop() # remove the last message (of the Assistant) inplace
-
-        # Now tokenize the conversation
-        ids, mask = self.render_conversation(conversation)
-
-        # Finally, to prime the Assistant for a completion, append the Assistant start token
-        assistant_start = self.encode_special("<|assistant_start|>")
-        ids.append(assistant_start)
-        return ids
 
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions

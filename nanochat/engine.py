@@ -187,14 +187,23 @@ class Engine:
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
-        # Get the special tokens we need to coordinate the tool use state machine
+        # Get the special tokens we need to coordinate generation.
+        # Instruct model: we stop on any of the task-specific output_end tokens,
+        # on the <|no_answer|> marker, or on <|bos|> (new document).
         get_special = lambda s: self.tokenizer.encode_special(s)
-        python_start = get_special("<|python_start|>")
-        python_end = get_special("<|python_end|>")
-        output_start = get_special("<|output_start|>")
-        output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+        bos = self.tokenizer.get_bos_token_id()
+        stop_tokens = {bos}
+        for name in ("<|answer_end|>", "<|json_end|>", "<|triple_end|>",
+                     "<|class_end|>", "<|summary_end|>", "<|no_answer|>"):
+            try:
+                stop_tokens.add(get_special(name))
+            except Exception:
+                pass  # tokenizer may not yet have every instruct token
+        # Backward-compat alias so the existing state-machine logic below still
+        # triggers on a "row complete" token.
+        assistant_end = next(iter(stop_tokens))  # any stop token works for single-row end
+        # Code REPL is no longer a built-in feature in instruct mode.
+        python_start = python_end = output_start = output_end = None
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
@@ -251,25 +260,26 @@ class Engine:
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
                 # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
+                if next_token in stop_tokens:
                     state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
+                # Handle tool logic (code REPL). Only active if the tokenizer
+                # provides the code_start/code_end tokens. Output wrapping is
+                # disabled (no output_start/end pair any more).
+                if python_start is not None:
+                    if next_token == python_start:
+                        state.in_python_block = True
+                        state.python_expr_tokens = []
+                    elif next_token == python_end and state.in_python_block:
+                        state.in_python_block = False
+                        if state.python_expr_tokens:
+                            expr = self.tokenizer.decode(state.python_expr_tokens)
+                            result = use_calculator(expr)
+                            if result is not None:
+                                result_tokens = self.tokenizer.encode(str(result))
+                                state.forced_tokens.extend(result_tokens)
+                        state.python_expr_tokens = []
+                    elif state.in_python_block:
+                        state.python_expr_tokens.append(next_token)
 
             # Yield the token column
             yield token_column, token_masks

@@ -1,11 +1,15 @@
-# nanochat-attnres
+# nanochat-attnres (a.k.a. nanoInstruct)
 
-Research fork of [karpathy/nanochat](https://github.com/karpathy/nanochat) exploring:
-1. **Hybrid conv-attention architectures** with gated depthwise convolutions
+Research fork of [karpathy/nanochat](https://github.com/karpathy/nanochat). **Despite the name, this is NOT a chat model** -- it is an **instruct-only model for grounded QA and structured extraction**. The model is trained to answer **only from the provided context** (counterfactual SFT, JEPA latent reasoning, multi-Talker dispatch).
+
+Three research axes:
+1. **Hybrid conv-attention architectures** with gated depthwise convolutions (LFM-inspired)
 2. **Attention Residuals** ([arxiv.org/abs/2603.15031](https://arxiv.org/abs/2603.15031)) -- learned depth-wise softmax attention
-3. **Latent reasoning preparation** -- groundwork for JEPA-style continuous thinking ([arxiv.org/abs/2512.19171](https://arxiv.org/abs/2512.19171))
+3. **JEPA-Reasoner + multi-Talker** ([arxiv.org/abs/2512.19171](https://arxiv.org/abs/2512.19171)) -- continuous latent thinking with task-specific decoders
 
 Target hardware: single-GPU training on RTX 5090 (32GB), H100 SXM (80GB), or NVIDIA DGX Spark (GB10 Blackwell, 128GB unified).
+
+See [`plan.md`](plan.md) for the full multi-phase training roadmap.
 
 ---
 
@@ -66,34 +70,94 @@ FP8 training enabled
 
 ---
 
-## JEPA Preparation (Phase 2 groundwork)
+## Instruct format & special tokens (37 total)
 
-This fork lays the groundwork for a future conversion to [JEPA-Reasoner](https://arxiv.org/abs/2512.19171) style latent reasoning, in which the model thinks in a continuous latent space before decoding any tokens.
+Defined in `nanochat/tokenizer.py:SPECIAL_TOKENS`. **No chat tokens** -- the model is instruct-only.
 
-### Already in place
+| Category | Tokens | Purpose |
+|----------|--------|---------|
+| Base | `<\|bos\|>` | Beginning of sequence |
+| Context | `<\|context_start\|>`, `<\|context_end\|>` | Wraps the documents/context the model must ground on |
+| Input | `<\|input_start\|>`, `<\|input_end\|>` | Wraps the instruction/question |
+| Task | `<\|qa\|>`, `<\|extract_json\|>`, `<\|extract_triples\|>`, `<\|classify\|>`, `<\|summarize\|>` | Dispatcher to specialized Talker (Phase 4) |
+| Reasoning | `<\|think_start\|>`, `<\|think_end\|>`, `<\|answer_start\|>`, `<\|answer_end\|>`, `<\|no_answer\|>` | Chain-of-thought + grounded answer |
+| Structured | `<\|json_start\|>`/`<\|json_end\|>`, `<\|triple_start\|>`/`<\|triple_end\|>`, `<\|class_start\|>`/`<\|class_end\|>`, `<\|summary_start\|>`/`<\|summary_end\|>` | Per-task output wrappers |
+| Code | `<\|code_start\|>`, `<\|code_end\|>` | Wrap code snippets in context or output |
+| Meta | `<\|citation_start\|>`, `<\|citation_end\|>`, `<\|uncertain\|>` | Citation pointers, uncertainty marker |
+| JEPA | `<\|latent\|>` | Placeholder for a latent thought (Phase 3) |
+| Reserved | `<\|reserved_0\|>` ... `<\|reserved_7\|>` | 8 future-proof slots |
 
-- **Tied initialization** of `wte` and `lm_head` (angular alignment via `F.normalize` + magnitude preservation). Starts at `cos_sim = 1.0`, drifts down during training but keeps residual correlation -- ideal starting point for JEPA SST.
+### Sample format
+
+```
+<|bos|>
+<|context_start|>
+[document(s) the model must ground on]
+<|context_end|>
+<|qa|>
+<|input_start|>[question]<|input_end|>
+<|think_start|>
+[reasoning STRICTLY from the context]
+<|think_end|>
+<|answer_start|>[answer]<|answer_end|>      # OR <|no_answer|>
+```
+
+### Counterfactual training (Phase 4 highlight)
+
+To teach the model "context > parametric memory", we generate counterfactual samples where the context contradicts known facts:
+
+```
+<|context_start|>La tour Eiffel est a Tokyo.<|context_end|>
+<|qa|>
+<|input_start|>Ou se trouve la tour Eiffel ?<|input_end|>
+<|think_start|>Le contexte indique Tokyo.<|think_end|>
+<|answer_start|>A Tokyo.<|answer_end|>
+```
+
+The model learns that the **context overrides any internalized knowledge** -- a meta-skill that generalizes to any factual question with provided context.
+
+## Multi-Talker architecture (post-Phase 3)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  REASONER (978M, frozen after JEPA Phase 3)                     │
+│  Generates continuous latent thoughts (no tokens yet)           │
+└─────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼ latents + raw context
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
+│ Talker_QA    │  │ Talker_JSON  │  │ Talker_Synthesis │
+│ ~200M        │  │ ~150M        │  │ ~250M            │
+│ Counterfact. │  │ Schema-aware │  │ Summarization    │
+└──────────────┘  └──────────────┘  └──────────────────┘
+```
+
+Each Talker is small (~100-250M), specialized on one task, and shares the same frozen Reasoner. **You can swap Talkers without re-training the Reasoner.**
+
+## JEPA preparation already in place (in this branch)
+
+- **Tied initialization** of `wte` and `lm_head` (angular alignment via `F.normalize` + magnitude preservation). Starts at `cos_sim = 1.0` -- ideal starting point for JEPA SST.
 - **`model/wte_lmhead_cos_sim`** tracked in wandb every 100 steps to observe the divergence.
-- **Hybrid conv-attention backbone** -- the Reasoner body is already built. Only the output head needs to be swapped.
+- **All 37 instruct special tokens in the tokenizer** -- their embeddings are co-trained from the start of Phase 1.
+- **Hybrid conv-attention backbone** -- the Reasoner body is already built. Only the output head needs to be swapped (Phase 3).
 
-### Roadmap (not yet implemented)
+## Roadmap (not yet implemented)
 
-The full JEPA pipeline requires three additions:
+See [`plan.md`](plan.md) for the full plan. Highlights of what remains:
 
-1. **Phase 2: Self-Supervised Training (SST)** -- replace cross-entropy with scaled cosine distance loss over L2-normalised hidden states, using an EMA teacher for the target. Estimated: ~100 lines in `scripts/jepa_sst.py`.
+1. **Phase 2: SFT format-aware** (3-5 days) -- light supervised training to teach the model the instruct format
+2. **Phase 3: JEPA SST** (5-10 days) -- convert to latent reasoner via cosine distance + EMA teacher
+3. **Phase 4: 5 specialized Talkers** (15-30 days) -- counterfactual QA, JSON, triples, classify, summarize
+4. **Phase 5: RL grounding** (optional, 10-20 days) -- DPO/GRPO with grounding verifier
 
-2. **Talker module** -- a small separate decoder (~200M params) trained on top of a frozen Reasoner to convert latent thoughts back to tokens. Estimated: ~80 lines in `scripts/train_talker.py`.
+## Open research directions
 
-3. **Latent-first inference** -- `scripts/chat_jepa.py` chains multiple latent thoughts in the Reasoner before invoking the Talker for token production.
-
-### Open research directions
-
-These are intentionally left for exploration:
-
-- **LCM-style concept prediction** -- predict sentence-level embeddings instead of token-level (potential integration with SONAR or self-trained sentence encoder).
-- **Recursive AttnRes** -- share weights across layers and let the AttnRes query learn how many loops to apply per token (adaptive depth, inspired by Huginn / Universal Transformers).
-- **Mistral embedding init** -- replace trained-from-scratch `wte` with a pretrained multilingual embedding (Mistral 7B v0.3 has matching `vocab_size=32768`).
-- **Hard-tied embeddings + AttnRes** -- empirically test whether the assumed gradient conflict actually degrades training.
+- **LCM-style concept prediction** -- predict sentence-level embeddings instead of token-level (SONAR or self-trained)
+- **Recursive AttnRes** -- share weights across layers, AttnRes query learns how many loops to apply per token (adaptive depth, Huginn / Universal Transformer style)
+- **Mistral embedding init** -- replace trained-from-scratch `wte` with Mistral 7B v0.3 (matching `vocab_size=32768`)
+- **Hard-tied embeddings + AttnRes** -- empirically test whether the assumed gradient conflict actually degrades training
 
 ---
 
