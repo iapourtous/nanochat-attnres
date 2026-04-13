@@ -107,4 +107,4 @@ echo ""
     --curriculum-phase1-ratio=0.6 \
     --curriculum-transition=2000 \
     --run="${RUN_NAME}" \
-    --save-every=10000
+    --save-every=2000

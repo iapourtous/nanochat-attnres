@@ -556,6 +556,20 @@ while True:
             },
             rank=ddp_rank,
         )
+        # Rotation: keep only the latest checkpoint on disk (save_every=10000 × 5GB
+        # would fill a small-disk instance fast). The dataloader_state_dict + step
+        # is enough to fully resume, so history is not required.
+        import glob as _glob
+        import re as _re
+        if ddp_rank == 0:
+            for pattern in ("model_*.pt", "meta_*.json", "optim_*_rank*.pt"):
+                for fpath in _glob.glob(os.path.join(checkpoint_dir, pattern)):
+                    m = _re.search(r"_(\d{6})", os.path.basename(fpath))
+                    if m and int(m.group(1)) != step:
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
