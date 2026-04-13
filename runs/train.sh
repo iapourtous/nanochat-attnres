@@ -39,9 +39,9 @@ MLP_TYPE=swiglu
 ROPE_BASE=1000000
 ATTN_RES_BLOCK_SIZE=8
 MAX_SEQ_LEN=2048
-# H100 80GB HBM3. With FP8 + activation checkpointing, 32 fits easily.
-# 32 * 2048 = 65536 tokens/micro-batch, 524288/65536 = 8 grad_accum exact.
-DEVICE_BATCH_SIZE=32
+# H100 80GB HBM3. 16 is a conservative batch to stay well under VRAM pressure.
+# 16 * 2048 = 32768 tokens/micro-batch, 524288/32768 = 16 grad_accum exact.
+DEVICE_BATCH_SIZE=16
 TOTAL_BATCH_SIZE=524288
 WINDOW_PATTERN=SSSL
 # Training ratio (scaling_params ≈ 928M for d32):
