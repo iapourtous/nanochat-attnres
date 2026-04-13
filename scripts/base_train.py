@@ -666,6 +666,13 @@ while True:
             log_data["model/backout_lambda"] = float(orig_model.backout_lambda.item())
             if args.use_attn_res:
                 log_data["model/attn_res_q_final_norm"] = float(orig_model.attn_res_q_final.norm().item())
+            # Angular alignment between wte and lm_head (tied init tracker).
+            # 1.0 at step 0 (tied init), drifts down during training. Useful signal
+            # for future JEPA Phase 2: the higher at end of Phase 1, the easier SST.
+            import torch.nn.functional as _F
+            wte_n = _F.normalize(orig_model.transformer.wte.weight, dim=-1)
+            lmh_n = _F.normalize(orig_model.lm_head.weight, dim=-1)
+            log_data["model/wte_lmhead_cos_sim"] = float((wte_n * lmh_n).sum(dim=-1).mean().item())
         # Curriculum weights (so we can see the phase transition on wandb)
         if curriculum_step_fn is not None:
             for cat, w in curriculum_step_fn().items():

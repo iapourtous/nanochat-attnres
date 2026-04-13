@@ -362,6 +362,17 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
+        # Tied initialization (angular alignment of wte and lm_head):
+        # Copy wte's directions into lm_head while preserving lm_head's small initial
+        # magnitude (std=0.001). This gives a better starting point for a future JEPA
+        # Phase 2 (SST) without changing training dynamics at step 0 (logits stay near
+        # zero). wte and lm_head will gradually diverge during training but keep a
+        # residual angular correlation, which is beneficial for latent-space methods.
+        with torch.no_grad():
+            wte_dirs = F.normalize(self.transformer.wte.weight.float(), dim=-1)
+            lm_head_mags = self.lm_head.weight.float().norm(dim=-1, keepdim=True)
+            self.lm_head.weight.copy_((wte_dirs * lm_head_mags).to(self.lm_head.weight.dtype))
+
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
         # because GradScaler cannot unscale fp16 gradients.
