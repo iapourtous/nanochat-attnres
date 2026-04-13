@@ -28,7 +28,7 @@ class MockModel:
     This ensures that with temperature > 0, different samples should
     (with very high probability) produce different tokens.
     """
-    def __init__(self, vocab_size=262):  # 256 bytes + 6 special tokens
+    def __init__(self, vocab_size=263):  # 256 bytes + 7 instruct stop tokens
         self.vocab_size = vocab_size
         self.config = MockConfig()
         self._device = torch.device("cpu")
@@ -50,22 +50,27 @@ class MockModel:
 class ByteTokenizer:
     """
     Simple byte-level tokenizer for testing.
-    Tokens 0-255 are raw bytes, 256+ are special tokens.
+    Tokens 0-255 are raw bytes, 256+ are instruct special tokens.
+
+    The mock matches the subset of special tokens that Engine._get_stop_tokens
+    queries: BOS plus the per-task end markers and <|no_answer|>.
     """
     def __init__(self):
-        # Special tokens start at 256
+        # Instruct stop tokens (cf. Engine._get_stop_tokens)
         self._special_tokens = {
-            "<|python_start|>": 256,
-            "<|python_end|>": 257,
-            "<|output_start|>": 258,
-            "<|output_end|>": 259,
-            "<|assistant_end|>": 260,
-            "<|bos|>": 261,
+            "<|bos|>":         256,
+            "<|answer_end|>":  257,
+            "<|json_end|>":    258,
+            "<|triple_end|>":  259,
+            "<|class_end|>":   260,
+            "<|summary_end|>": 261,
+            "<|no_answer|>":   262,
         }
-        self._bos = 261
+        self._bos = self._special_tokens["<|bos|>"]
 
     def encode_special(self, s):
-        return self._special_tokens[s]
+        # Returns None for unknown tokens so callers can probe optional ones.
+        return self._special_tokens.get(s)
 
     def get_bos_token_id(self):
         return self._bos
@@ -164,16 +169,16 @@ def test_multi_sample_first_token_diversity():
     rows, causing all samples to start identically. The fix expands the prefill logits
     to num_samples and samples independently for each row.
 
-    With uniform logits over 262 tokens and 16 samples, the probability that all
-    samples independently pick the same token is (1/262)^15 ≈ 10^-36. So if they're
+    With uniform logits over 263 tokens and 16 samples, the probability that all
+    samples independently pick the same token is (1/263)^15 ≈ 10^-36. So if they're
     all identical, it indicates tokens are being broadcast instead of independently sampled.
     """
-    model = MockModel(vocab_size=262)
+    model = MockModel(vocab_size=263)
     tokenizer = ByteTokenizer()
     engine = Engine(model, tokenizer)
 
     # Generate 16 samples with temperature=1.0 (stochastic sampling)
-    prompt_tokens = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+    prompt_tokens = [256, 72, 101, 108, 108, 111]  # <bos> + "Hello"
     num_samples = 16
 
     # Collect the first generated token from each sample
@@ -202,7 +207,7 @@ def test_seed_reproducibility():
     """Same seed must produce identical output."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+    prompt = [256, 72, 101, 108, 108, 111]  # <bos> + "Hello"
 
     for seed in [1, 42, 123, 999]:
         r1, _ = engine.generate_batch(prompt, max_tokens=5, seed=seed)
@@ -215,7 +220,7 @@ def test_temperature_zero_determinism():
     """Temperature=0 is deterministic regardless of seed."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]
+    prompt = [256, 72, 101, 108, 108, 111]
 
     r1, _ = engine.generate_batch(prompt, temperature=0.0, max_tokens=5, seed=1)
     r2, _ = engine.generate_batch(prompt, temperature=0.0, max_tokens=5, seed=42)
@@ -227,7 +232,7 @@ def test_max_tokens_respected():
     """Generation stops at max_tokens limit."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]
+    prompt = [256, 72, 101, 108, 108, 111]
 
     for max_tokens in [1, 4, 16, 64]:
         results, _ = engine.generate_batch(prompt, max_tokens=max_tokens)
@@ -239,7 +244,7 @@ def test_num_samples_count():
     """num_samples=N produces exactly N sequences."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]
+    prompt = [256, 72, 101, 108, 108, 111]
 
     for num_samples in [1, 4, 16, 64]:
         results, _ = engine.generate_batch(prompt, num_samples=num_samples, max_tokens=3)
@@ -250,7 +255,7 @@ def test_different_seeds_introduce_variation_when_temperature_nonzero():
     """With temperature > 0, different seeds should introduce sampling variation."""
     model = MockModel()
     engine = Engine(model, ByteTokenizer())
-    prompt = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
+    prompt = [256, 72, 101, 108, 108, 111]  # <bos> + "Hello"
 
     outputs = set()
 

@@ -13,6 +13,29 @@ See [`plan.md`](plan.md) for the full multi-phase training roadmap.
 
 ---
 
+## Branches
+
+| Branch | Hardware | Config | Status |
+|--------|----------|--------|--------|
+| `main` | RTX 5090 (32GB) | d26, ~978M params, no FP8 | maintained |
+| `h100` | H100 SXM (80GB), x86_64 | d32, FP8, compile, batch 12 | **active dev** |
+| `dgxSpark` | DGX Spark GB10 (128GB unified, aarch64) | d32, FP8, compile, swap guard, nightly cu128 | maintained |
+
+Switch branch with `git checkout <branch>` then `bash runs/setup_server.sh` and `bash runs/train.sh`.
+
+## Project status
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 0 | Tokenizer with 37 instruct special tokens, tied init | complete |
+| 1 | Base pretraining (hybrid SSSL + AttnRes + curriculum + FP8) | **in progress** (~25 days on H100) |
+| 2 | SFT format-aware (light, teach the instruct format) | not started |
+| 3 | JEPA SST (convert to latent reasoner) | not started |
+| 4 | Multi-Talker training (qa / json / triples / classify / summarize) | not started |
+| 5 | RL grounding (DPO / GRPO with grounding verifier) | not started |
+
+---
+
 ## Architecture
 
 **Hybrid conv-attention model, ~978M params**. Not a pure transformer.
@@ -258,17 +281,29 @@ The training script logs rich diagnostics every 100 steps:
 
 ### Inference
 
-```bash
-python -m scripts.chat_cli     # CLI chat
-python -m scripts.chat_web     # Web UI (FastAPI, optional multi-GPU data parallelism)
+Inference scripts are **not yet implemented**. They will be added once the Talker decoders are trained (Phase 4 in `plan.md`). For now you can use `nanochat/engine.py` as a low-level token-streaming primitive:
+
+```python
+from nanochat.engine import Engine
+from nanochat.checkpoint_manager import load_model
+
+model, tokenizer, _ = load_model("base", "d32", step=180000)
+engine = Engine(model, tokenizer)
+
+prompt_ids = tokenizer.render_for_completion({
+    "task": "qa",
+    "context": "La tour Eiffel est a Paris.",
+    "input": "Ou est la tour Eiffel ?",
+})
+results, _ = engine.generate_batch(prompt_ids, max_tokens=64)
+print(tokenizer.decode(results[0]))
 ```
 
 ### Tests
 
 ```bash
-uv run python -m pytest tests/ -v
-uv run python -m pytest tests/test_engine.py -v        # single file
-uv run python -m pytest -m "not slow" tests/           # skip slow
+uv run --no-sync python -m pytest tests/ -v
+uv run --no-sync python -m pytest tests/test_engine.py -v
 ```
 
 ---

@@ -13,70 +13,9 @@ The whole thing is made as efficient as possible.
 
 import torch
 import torch.nn.functional as F
-import signal
-import warnings
-from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
-
-# -----------------------------------------------------------------------------
-# Calculator tool helpers
-@contextmanager
-def timeout(duration, formula):
-    def timeout_handler(signum, frame):
-        raise Exception(f"'{formula}': timed out after {duration} seconds")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
-    yield
-    signal.alarm(0)
-
-def eval_with_timeout(formula, max_time=3):
-    try:
-        with timeout(max_time, formula):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                return eval(formula, {"__builtins__": {}}, {})
-    except Exception as e:
-        signal.alarm(0)
-        # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
-        return None
-
-def use_calculator(expr):
-    """
-    Evaluate a Python expression safely.
-    Supports both math expressions and string operations like .count()
-    """
-    # Remove commas from numbers
-    expr = expr.replace(",", "")
-
-    # Check if it's a pure math expression (old behavior)
-    if all([x in "0123456789*+-/.() " for x in expr]):
-        if "**" in expr:  # disallow power operator
-            return None
-        return eval_with_timeout(expr)
-
-    # Check if it's a string operation we support
-    # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
-    allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\"()._ "
-    if not all([x in allowed_chars for x in expr]):
-        return None
-
-    # Disallow dangerous patterns
-    dangerous_patterns = ['__', 'import', 'exec', 'eval', 'compile', 'open', 'file',
-                         'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
-                         'getattr', 'setattr', 'delattr', 'hasattr']
-    expr_lower = expr.lower()
-    if any(pattern in expr_lower for pattern in dangerous_patterns):
-        return None
-
-    # Only allow .count() method for now (can expand later)
-    if '.count(' not in expr:
-        return None
-
-    # Evaluate with timeout
-    return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
 class KVCache:
@@ -161,16 +100,37 @@ class RowState:
     # Per-row state tracking during generation
     def __init__(self, current_tokens=None):
         self.current_tokens = current_tokens or [] # Current token sequence for this row
-        self.forced_tokens = deque() # Queue of tokens to force inject
-        self.in_python_block = False # Whether we are inside a python block
-        self.python_expr_tokens = [] # Tokens of the current python expression
+        self.forced_tokens = deque() # Queue of tokens to force inject (kept for future tool use)
         self.completed = False # Whether this row has completed generation
 
 class Engine:
 
     def __init__(self, model, tokenizer):
         self.model = model
-        self.tokenizer = tokenizer # needed for tool use
+        self.tokenizer = tokenizer
+
+    def _get_stop_tokens(self):
+        """Set of token ids that signal end of generation in instruct mode.
+
+        - <|bos|> : start of a new document (model jumped past its turn)
+        - <|answer_end|>, <|json_end|>, <|triple_end|>, <|class_end|>, <|summary_end|>
+          : per-task structured output end markers
+        - <|no_answer|> : "not in context" sentinel (single-token answer)
+
+        Tokens that the current tokenizer does not know about are silently skipped
+        so that callers can use either the legacy 9-token tokenizer or the new
+        37-token instruct tokenizer.
+        """
+        stop = {self.tokenizer.get_bos_token_id()}
+        for name in ("<|answer_end|>", "<|json_end|>", "<|triple_end|>",
+                     "<|class_end|>", "<|summary_end|>", "<|no_answer|>"):
+            try:
+                tid = self.tokenizer.encode_special(name)
+                if tid is not None:
+                    stop.add(tid)
+            except Exception:
+                pass
+        return stop
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -187,23 +147,8 @@ class Engine:
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
-        # Get the special tokens we need to coordinate generation.
-        # Instruct model: we stop on any of the task-specific output_end tokens,
-        # on the <|no_answer|> marker, or on <|bos|> (new document).
-        get_special = lambda s: self.tokenizer.encode_special(s)
-        bos = self.tokenizer.get_bos_token_id()
-        stop_tokens = {bos}
-        for name in ("<|answer_end|>", "<|json_end|>", "<|triple_end|>",
-                     "<|class_end|>", "<|summary_end|>", "<|no_answer|>"):
-            try:
-                stop_tokens.add(get_special(name))
-            except Exception:
-                pass  # tokenizer may not yet have every instruct token
-        # Backward-compat alias so the existing state-machine logic below still
-        # triggers on a "row complete" token.
-        assistant_end = next(iter(stop_tokens))  # any stop token works for single-row end
-        # Code REPL is no longer a built-in feature in instruct mode.
-        python_start = python_end = output_start = output_end = None
+        # Stop tokens for the instruct mode (see _get_stop_tokens).
+        stop_tokens = self._get_stop_tokens()
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
@@ -259,27 +204,9 @@ class Engine:
                 token_column.append(next_token)
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
+                # On any instruct stop token, mark the row as completed
                 if next_token in stop_tokens:
                     state.completed = True
-                # Handle tool logic (code REPL). Only active if the tokenizer
-                # provides the code_start/code_end tokens. Output wrapping is
-                # disabled (no output_start/end pair any more).
-                if python_start is not None:
-                    if next_token == python_start:
-                        state.in_python_block = True
-                        state.python_expr_tokens = []
-                    elif next_token == python_end and state.in_python_block:
-                        state.in_python_block = False
-                        if state.python_expr_tokens:
-                            expr = self.tokenizer.decode(state.python_expr_tokens)
-                            result = use_calculator(expr)
-                            if result is not None:
-                                result_tokens = self.tokenizer.encode(str(result))
-                                state.forced_tokens.extend(result_tokens)
-                        state.python_expr_tokens = []
-                    elif state.in_python_block:
-                        state.python_expr_tokens.append(next_token)
 
             # Yield the token column
             yield token_column, token_masks
@@ -293,17 +220,17 @@ class Engine:
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
+        Terminal tokens (instruct stop tokens: <|*_end|>, <|no_answer|>, <|bos|>)
+        are not included in the results.
         """
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        bos = self.tokenizer.get_bos_token_id()
+        stop_tokens = self._get_stop_tokens()
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
-                    if token == assistant_end or token == bos:
+                    if token in stop_tokens:
                         completed[i] = True
                     else:
                         results[i].append(token)

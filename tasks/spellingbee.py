@@ -299,9 +299,3 @@ if __name__ == "__main__":
     #     print(ex['messages'][0]['content'])
     #     print("-" * 100)
     #     print(ex['messages'][1]['content'])
-
-    # # also scrutinize the tokenization (last example only)
-    # from nanochat.tokenizer import get_tokenizer
-    # tokenizer = get_tokenizer()
-    # ids, mask = tokenizer.render_conversation(ex)
-    # print(tokenizer.visualize_tokenization(ids, mask, with_token_id=True))
